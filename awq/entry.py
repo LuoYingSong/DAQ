@@ -8,6 +8,7 @@ from accelerate import init_empty_weights, infer_auto_device_map, dispatch_model
 from accelerate.utils.modeling import get_balanced_memory
 from awq.utils.parallel import auto_parallel
 from awq.quantize.pre_quant import run_awq, apply_awq
+from awq.quantize.daq import run_daq
 from awq.quantize.quantizer import pseudo_quantize_model_weight, real_quantize_model_weight
 from awq.utils.lm_eval_adaptor import LMEvalAdaptor
 from awq.utils.utils import simple_dispatch_model
@@ -48,6 +49,14 @@ parser.add_argument('--run_awq', action='store_true',
 parser.add_argument('--dump_awq', type=str, default=None,
                     help="save the awq search results")
 parser.add_argument('--load_awq', type=str, default=None,
+                    help="load the awq search results")
+
+
+parser.add_argument('--run_daq', action='store_true',
+                    help="perform awq search process")
+parser.add_argument('--dump_daq', action='store_true',
+                    help="perform awq search process")
+parser.add_argument('--load_daq', type=str, default=None,
                     help="load the awq search results")
 args = parser.parse_args()
 
@@ -123,7 +132,7 @@ def build_model_and_enc(model_path):
             awq_results = run_awq(
                 model, enc,
                 w_bit=args.w_bit, q_config=q_config,
-                n_samples=128, seqlen=512,
+                n_samples=50, seqlen=512,
             )
             if args.dump_awq:
                 dirpath = os.path.dirname(args.dump_awq)
@@ -132,7 +141,7 @@ def build_model_and_enc(model_path):
                 torch.save(awq_results, args.dump_awq)
                 print("AWQ results saved at", args.dump_awq)
                 
-            exit(0)
+            # exit(0)
                 
         if args.load_awq:
             print("Loading pre-computed AWQ results from", args.load_awq)
@@ -187,12 +196,51 @@ def main():
         exit()
 
     # a hack here to auto set model group
-    model, enc = build_model_and_enc(args.model_path)
+    if args.run_daq:
+        model_path = args.model_path
+        if not os.path.exists(model_path):  # look into ssd
+            raise FileNotFoundError(f"{model_path} not found!")
+        print(f"* Building model {model_path}")
+
+        # all hf model
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if "mpt" in config.__class__.__name__.lower():
+            enc = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
+        else:
+            enc = AutoTokenizer.from_pretrained(model_path, use_fast=False, trust_remote_code=True)
+        kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, config=config, trust_remote_code=True, **kwargs)
+
+        model.eval()
+        awq_results = run_daq(
+            model, enc,
+            w_bit=args.w_bit, q_config=q_config,
+            n_samples=50, seqlen=512,
+            hyper_parameters={'data_types': 'nf4',
+                              'bins':100,
+                              'epsilon':.001,
+                              'alpha':.001,
+                              'num_epoch':500,
+                              'num_iter':100,
+                              'group':args.q_group_size}
+        )
+    else:
+        model, enc = build_model_and_enc(args.model_path)
+        # model_path = args.model_path
+        # kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
+        # config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        # if "mpt" in config.__class__.__name__.lower():
+        #     enc = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
+        # else:
+        #     enc = AutoTokenizer.from_pretrained(model_path, use_fast=False, trust_remote_code=True)
+        # model = AutoModelForCausalLM.from_pretrained(
+        #     args.model_path, config=config, trust_remote_code=True, **kwargs)
 
     if args.tasks is not None:
         task_names = args.tasks.split(",")
 
-        lm_eval_model = LMEvalAdaptor(args.model_path, model, enc, args.batch_size)
+        lm_eval_model = LMEvalAdaptor(args.model_path, model.cuda(), enc, args.batch_size)
         results = evaluator.simple_evaluate(
             model=lm_eval_model,
             tasks=task_names,

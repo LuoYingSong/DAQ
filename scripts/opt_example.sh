@@ -6,7 +6,7 @@ python -m awq.entry --model_path /dataset/opt/$MODEL \
     --run_awq --dump_awq awq_cache/$MODEL-w4-g128.pt
 
 # evaluate the AWQ quantize model (simulated pseudo quantization)
-python -m awq.entry --model_path /dataset/opt/$MODEL \
+python -m awq.entry --model_path facebook/opt-125m \
     --tasks wikitext \
     --w_bit 4 --q_group_size 128 \
     --load_awq awq_cache/$MODEL-w4-g128.pt \
