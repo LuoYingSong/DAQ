@@ -8,11 +8,10 @@ from accelerate import init_empty_weights, infer_auto_device_map, dispatch_model
 from accelerate.utils.modeling import get_balanced_memory
 from awq.utils.parallel import auto_parallel
 from awq.quantize.pre_quant import run_awq, apply_awq
-from awq.quantize.daq import run_daq
+from awq.quantize.daq import run_daq, daq_apply_scale
 from awq.quantize.quantizer import pseudo_quantize_model_weight, real_quantize_model_weight
 from awq.utils.lm_eval_adaptor import LMEvalAdaptor
 from awq.utils.utils import simple_dispatch_model
-
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_path', type=str, help='path of the hf model')
@@ -26,9 +25,9 @@ parser.add_argument('--parallel', action='store_true',
 # max memory to offload larger models to CPU
 parser.add_argument('--max_memory', type=str, nargs='*',
                     help="List of device_id:max_memory pairs to be parsed into a dictionary; " \
-                        + "Example: 0:10GiB 1:10GiB cpu:30GiB; " \
-                        + "mode details here: " \
-                        + "https://huggingface.co/docs/accelerate/usage_guides/big_modeling")
+                         + "Example: 0:10GiB 1:10GiB cpu:30GiB; " \
+                         + "mode details here: " \
+                         + "https://huggingface.co/docs/accelerate/usage_guides/big_modeling")
 parser.add_argument('--auto_parallel', action='store_true',
                     help="automatically set parallel and batch_size")
 # quantization config
@@ -51,17 +50,16 @@ parser.add_argument('--dump_awq', type=str, default=None,
 parser.add_argument('--load_awq', type=str, default=None,
                     help="load the awq search results")
 
-
 parser.add_argument('--run_daq', action='store_true',
                     help="perform awq search process")
-parser.add_argument('--dump_daq', action='store_true',
-                    help="perform awq search process")
+parser.add_argument('--dump_daq', type=str, default=None,
+                    help="save the awq search results")
 parser.add_argument('--load_daq', type=str, default=None,
                     help="load the awq search results")
 args = parser.parse_args()
 
 max_memory = [v.split(':') for v in (args.max_memory or [])]
-max_memory = {(int(k) if k.isdigit() else k):v for k,v in max_memory}
+max_memory = {(int(k) if k.isdigit() else k): v for k, v in max_memory}
 
 if args.auto_parallel:
     gpu_list = auto_parallel(args)
@@ -73,6 +71,14 @@ q_config = {
 
 }
 print("Quantization config:", q_config)
+
+hyper_parameters={'data_types': 'nf4',
+                                  'bins': 10,
+                                  'epsilon': .001,
+                                  'alpha': .001,
+                                  'num_epoch': 5,
+                                  'num_iter': 100,
+                                  'group': args.q_group_size}
 
 # build model and tokenizer
 
@@ -95,9 +101,9 @@ def build_model_and_enc(model_path):
                                                      torch_dtype=torch.float16, trust_remote_code=True)
         real_quantize_model_weight(
             model, w_bit=args.w_bit, q_config=q_config, init_only=True)
-        
+
         model.tie_weights()
-        
+
         # Infer device map
         kwargs = {"max_memory": max_memory} if len(max_memory) else {}
         device_map = infer_auto_device_map(
@@ -128,7 +134,7 @@ def build_model_and_enc(model_path):
 
         if args.run_awq:
             assert args.dump_awq, "Please save the awq results with --dump_awq"
-                        
+
             awq_results = run_awq(
                 model, enc,
                 w_bit=args.w_bit, q_config=q_config,
@@ -137,19 +143,36 @@ def build_model_and_enc(model_path):
             if args.dump_awq:
                 dirpath = os.path.dirname(args.dump_awq)
                 os.makedirs(dirpath, exist_ok=True)
-                
+
                 torch.save(awq_results, args.dump_awq)
                 print("AWQ results saved at", args.dump_awq)
-                
+        if args.run_daq:
+            awq_results = run_daq(
+                model, enc,
+                w_bit=args.w_bit, q_config=q_config,
+                n_samples=50, seqlen=512,
+                hyper_parameters=hyper_parameters
+            )
+            if args.dump_daq:
+                dirpath = os.path.dirname(args.dump_daq)
+                os.makedirs(dirpath, exist_ok=True)
+
+                torch.save(awq_results, args.dump_daq)
+                print("AWQ results saved at", args.dump_daq)
             # exit(0)
-                
+
         if args.load_awq:
             print("Loading pre-computed AWQ results from", args.load_awq)
             awq_results = torch.load(args.load_awq, map_location="cpu")
             apply_awq(model, awq_results)
 
+        if args.load_daq:
+            print("Loading pre-computed daq results from", args.load_daq)
+            awq_results = torch.load(args.load_daq, map_location="cpu")
+            daq_apply_scale(model, awq_results['scale'], hyper_parameters['data_types'])
+
         # weight quantization
-        if args.w_bit is not None:
+        if args.w_bit is not None and (args.load_awq or args.run_awq):
             if args.q_backend == "fake":
                 assert args.dump_quant is None, \
                     "Need to use real quantization to dump quantized weights"
@@ -163,14 +186,14 @@ def build_model_and_enc(model_path):
                 if args.dump_quant:
                     dirpath = os.path.dirname(args.dump_quant)
                     os.makedirs(dirpath, exist_ok=True)
-                    
+
                     print(
                         f"Saving the quantized model at {args.dump_quant}...")
                     torch.save(model.cpu().state_dict(), args.dump_quant)
                     exit(0)
             else:
                 raise NotImplementedError
-            
+
         # Move the model to GPU (as much as possible) for LM evaluation
         kwargs = {"max_memory": get_balanced_memory(model, max_memory if len(max_memory) > 0 else None)}
         device_map = infer_auto_device_map(
@@ -195,47 +218,16 @@ def main():
         print(f"Found existing AWQ results {args.dump_awq}, exit.")
         exit()
 
-    # a hack here to auto set model group
-    if args.run_daq:
-        model_path = args.model_path
-        if not os.path.exists(model_path):  # look into ssd
-            raise FileNotFoundError(f"{model_path} not found!")
-        print(f"* Building model {model_path}")
-
-        # all hf model
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        if "mpt" in config.__class__.__name__.lower():
-            enc = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
-        else:
-            enc = AutoTokenizer.from_pretrained(model_path, use_fast=False, trust_remote_code=True)
-        kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, config=config, trust_remote_code=True, **kwargs)
-
-        model.eval()
-        awq_results = run_daq(
-            model, enc,
-            w_bit=args.w_bit, q_config=q_config,
-            n_samples=50, seqlen=512,
-            hyper_parameters={'data_types': 'nf4',
-                              'bins':100,
-                              'epsilon':.001,
-                              'alpha':.001,
-                              'num_epoch':500,
-                              'num_iter':100,
-                              'group':args.q_group_size}
-        )
-    else:
-        model, enc = build_model_and_enc(args.model_path)
-        # model_path = args.model_path
-        # kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
-        # config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        # if "mpt" in config.__class__.__name__.lower():
-        #     enc = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
-        # else:
-        #     enc = AutoTokenizer.from_pretrained(model_path, use_fast=False, trust_remote_code=True)
-        # model = AutoModelForCausalLM.from_pretrained(
-        #     args.model_path, config=config, trust_remote_code=True, **kwargs)
+    model, enc = build_model_and_enc(args.model_path)
+    # model_path = args.model_path
+    # kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
+    # config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    # if "mpt" in config.__class__.__name__.lower():
+    #     enc = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
+    # else:
+    #     enc = AutoTokenizer.from_pretrained(model_path, use_fast=False, trust_remote_code=True)
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     args.model_path, config=config, trust_remote_code=True, **kwargs)
 
     if args.tasks is not None:
         task_names = args.tasks.split(",")
