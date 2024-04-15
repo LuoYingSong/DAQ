@@ -4,44 +4,59 @@ import torch
 import argparse
 import os
 import json
-from accelerate import init_empty_weights, infer_auto_device_map, dispatch_model, load_checkpoint_in_model
+from accelerate import (
+    init_empty_weights,
+    infer_auto_device_map,
+    dispatch_model,
+    load_checkpoint_in_model,
+)
 from accelerate.utils.modeling import get_balanced_memory
 from awq.utils.parallel import auto_parallel
 from awq.quantize.pre_quant import run_awq, apply_awq
 from awq.quantize.daq import run_daq, daq_apply_scale
 from awq.quantize.quantizer import pseudo_quantize_model_weight, real_quantize_model_weight
+from awq.quantize.quantizer import (
+    pseudo_quantize_model_weight,
+    real_quantize_model_weight,
+)
 from awq.utils.lm_eval_adaptor import LMEvalAdaptor
 from awq.utils.utils import simple_dispatch_model
 
+from datasets import load_dataset
+from torch import nn
+import tqdm
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--model_path', type=str, help='path of the hf model')
-parser.add_argument('--batch_size', type=int, default=1, help='batch size')
+parser.add_argument("--model_path", type=str, help="path of the hf model")
+parser.add_argument("--batch_size", type=int, default=1, help="batch size")
 parser.add_argument("--tasks", default=None, type=str)
 parser.add_argument("--output_path", default=None, type=str)
-parser.add_argument('--num_fewshot', type=int, default=0)
+parser.add_argument("--num_fewshot", type=int, default=0)
 # model config
-parser.add_argument('--parallel', action='store_true',
-                    help="enable model parallelism")
+parser.add_argument("--parallel", action="store_true", help="enable model parallelism")
 # max memory to offload larger models to CPU
-parser.add_argument('--max_memory', type=str, nargs='*',
-                    help="List of device_id:max_memory pairs to be parsed into a dictionary; " \
-                         + "Example: 0:10GiB 1:10GiB cpu:30GiB; " \
-                         + "mode details here: " \
-                         + "https://huggingface.co/docs/accelerate/usage_guides/big_modeling")
-parser.add_argument('--auto_parallel', action='store_true',
-                    help="automatically set parallel and batch_size")
+parser.add_argument(
+    "--max_memory",
+    type=str,
+    nargs="*",
+    help="List of device_id:max_memory pairs to be parsed into a dictionary; "
+    + "Example: 0:10GiB 1:10GiB cpu:30GiB; "
+    + "mode details here: "
+    + "https://huggingface.co/docs/accelerate/usage_guides/big_modeling",
+)
+parser.add_argument(
+    "--auto_parallel",
+    action="store_true",
+    help="automatically set parallel and batch_size",
+)
 # quantization config
-parser.add_argument('--w_bit', type=int, default=None)
-parser.add_argument('--q_group_size', type=int, default=-1)
-parser.add_argument('--no_zero_point', action='store_true',
-                    help="disable zero_point")
-parser.add_argument('--q_backend', type=str,
-                    default="fake", choices=["fake", "real"])
+parser.add_argument("--w_bit", type=int, default=None)
+parser.add_argument("--q_group_size", type=int, default=-1)
+parser.add_argument("--no_zero_point", action="store_true", help="disable zero_point")
+parser.add_argument("--q_backend", type=str, default="fake", choices=["fake", "real"])
 # save/load real quantized weights
-parser.add_argument('--dump_quant', type=str, default=None,
-                    help='save quantized model')
-parser.add_argument('--load_quant', type=str, default=None,
-                    help='load quantized model')
+parser.add_argument("--dump_quant", type=str, default=None, help="save quantized model")
+parser.add_argument("--load_quant", type=str, default=None, help="load quantized model")
 # apply/save/load awq
 parser.add_argument('--run_awq', action='store_true',
                     help="perform awq search process")
@@ -56,7 +71,7 @@ parser.add_argument('--run_daq', action='store_true',
                     help="perform awq search process")
 args = parser.parse_args()
 
-max_memory = [v.split(':') for v in (args.max_memory or [])]
+max_memory = [v.split(":") for v in (args.max_memory or [])]
 max_memory = {(int(k) if k.isdigit() else k): v for k, v in max_memory}
 
 if args.auto_parallel:
@@ -66,7 +81,6 @@ if args.auto_parallel:
 q_config = {
     "zero_point": not args.no_zero_point,  # by default True
     "q_group_size": args.q_group_size,  # whether to use group quantization
-
 }
 print("Quantization config:", q_config)
 
@@ -80,25 +94,44 @@ hyper_parameters={'data_types': 'nf4',
 
 # build model and tokenizer
 
+
 def build_model_and_enc(model_path):
     if not os.path.exists(model_path):  # look into ssd
         raise FileNotFoundError(f"{model_path} not found!")
     print(f"* Building model {model_path}")
 
     # all hf model
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    if "mpt" in config.__class__.__name__.lower():
-        enc = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
+    if "llava" in model_path.lower() or "vila" in model_path.lower():
+        from llava.model.builder import load_pretrained_model
+        from llava.mm_utils import get_model_name_from_path
+
+        enc, model, image_processor, context_len = load_pretrained_model(
+            model_path=model_path,
+            model_base=None,
+            model_name=get_model_name_from_path(model_path),
+            device="cpu",
+            **{"use_cache": False}
+        )
     else:
-        enc = AutoTokenizer.from_pretrained(model_path, use_fast=False, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if "mpt" in config.__class__.__name__.lower():
+            enc = AutoTokenizer.from_pretrained(
+                config.tokenizer_name, trust_remote_code=True
+            )
+        else:
+            enc = AutoTokenizer.from_pretrained(
+                model_path, use_fast=False, trust_remote_code=True
+            )
 
     if args.load_quant:  # directly load quantized weights
         print("Loading pre-computed quantized weights...")
         with init_empty_weights():
-            model = AutoModelForCausalLM.from_config(config=config,
-                                                     torch_dtype=torch.float16, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_config(
+                config=config, torch_dtype=torch.float16, trust_remote_code=True
+            )
         real_quantize_model_weight(
-            model, w_bit=args.w_bit, q_config=q_config, init_only=True)
+            model, w_bit=args.w_bit, q_config=q_config, init_only=True
+        )
 
         model.tie_weights()
 
@@ -107,8 +140,13 @@ def build_model_and_enc(model_path):
         device_map = infer_auto_device_map(
             model,
             no_split_module_classes=[
-                "OPTDecoderLayer", "LlamaDecoderLayer", "BloomBlock", "MPTBlock", "DecoderLayer"],
-            **kwargs
+                "OPTDecoderLayer",
+                "LlamaDecoderLayer",
+                "BloomBlock",
+                "MPTBlock",
+                "DecoderLayer",
+            ],
+            **kwargs,
         )
         # Load checkpoint in the model
         load_checkpoint_in_model(
@@ -122,11 +160,13 @@ def build_model_and_enc(model_path):
 
         model.eval()
     else:  # fp16 to quantized
-        args.run_awq &= not args.load_awq  # if load, no need to run awq
+        args.run_awq &= not args.load_awq  # if load_awq, no need to run awq
         # Init model on CPU:
         kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, config=config, trust_remote_code=True, **kwargs)
+        if not ("llava" in model_path.lower() or "vila" in model_path.lower()):
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path, config=config, trust_remote_code=True, **kwargs
+            )
 
         model.eval()
 
@@ -178,28 +218,37 @@ def build_model_and_enc(model_path):
                     model, w_bit=args.w_bit, q_config=q_config
                 )
             elif args.q_backend == "real":  # real quantization
-                real_quantize_model_weight(
-                    model, w_bit=args.w_bit, q_config=q_config
-                )
+                real_quantize_model_weight(model, w_bit=args.w_bit, q_config=q_config)
                 if args.dump_quant:
+                    if not args.dump_quant.endswith("v2.pt"):
+                        print("[Info] Auto-change the dump_quant file name to *v2.pt")
+                        args.dump_quant = args.dump_quant.replace(".pt", "-v2.pt")
                     dirpath = os.path.dirname(args.dump_quant)
                     os.makedirs(dirpath, exist_ok=True)
 
-                    print(
-                        f"Saving the quantized model at {args.dump_quant}...")
+                    print(f"Saving the quantized model at {args.dump_quant}...")
                     torch.save(model.cpu().state_dict(), args.dump_quant)
                     exit(0)
             else:
                 raise NotImplementedError
-
+            
         # Move the model to GPU (as much as possible) for LM evaluation
-        kwargs = {"max_memory": get_balanced_memory(model, max_memory if len(max_memory) > 0 else None)}
+        kwargs = {
+            "max_memory": get_balanced_memory(
+                model, max_memory if len(max_memory) > 0 else None
+            )
+        }
         device_map = infer_auto_device_map(
             model,
             # TODO: can we remove this?
             no_split_module_classes=[
-                "OPTDecoderLayer", "LlamaDecoderLayer", "BloomBlock", "MPTBlock", "DecoderLayer"],
-            **kwargs
+                "OPTDecoderLayer",
+                "LlamaDecoderLayer",
+                "BloomBlock",
+                "MPTBlock",
+                "DecoderLayer",
+            ],
+            **kwargs,
         )
         model = dispatch_model(model, device_map=device_map)
 
@@ -216,30 +265,57 @@ def main():
         print(f"Found existing AWQ results {args.dump}, exit.")
         exit()
 
+    # a hack here to auto set model group
     model, enc = build_model_and_enc(args.model_path)
-    # model_path = args.model_path
-    # kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
-    # config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    # if "mpt" in config.__class__.__name__.lower():
-    #     enc = AutoTokenizer.from_pretrained(config.tokenizer_name, trust_remote_code=True)
-    # else:
-    #     enc = AutoTokenizer.from_pretrained(model_path, use_fast=False, trust_remote_code=True)
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     args.model_path, config=config, trust_remote_code=True, **kwargs)
 
     if args.tasks is not None:
-        task_names = args.tasks.split(",")
+        # https://github.com/IST-DASLab/gptq/blob/2d65066eeb06a5c9ff5184d8cebdf33662c67faf/llama.py#L206
+        if args.tasks == "wikitext":
+            testenc = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+            testenc = enc("\n\n".join(testenc["text"]), return_tensors="pt")
+            model.seqlen = 2048
+            testenc = testenc.input_ids.to(model.device)
+            nsamples = testenc.numel() // model.seqlen
+            model = model.eval()
+            nlls = []
+            for i in tqdm.tqdm(range(nsamples), desc="evaluating..."):
+                batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(
+                    model.device
+                )
+                with torch.no_grad():
+                    lm_logits = model(batch).logits
+                shift_logits = lm_logits[:, :-1, :].contiguous().float()
+                shift_labels = testenc[
+                    :, (i * model.seqlen) : ((i + 1) * model.seqlen)
+                ][:, 1:]
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+                )
+                neg_log_likelihood = loss.float() * model.seqlen
+                nlls.append(neg_log_likelihood)
 
-        lm_eval_model = LMEvalAdaptor(args.model_path, model, enc, args.batch_size)
-        results = evaluator.simple_evaluate(
-            model=lm_eval_model,
-            tasks=task_names,
-            batch_size=args.batch_size,
-            no_cache=True,
-            num_fewshot=args.num_fewshot,
-        )
+            ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+            print(ppl.item())
 
-        print(evaluator.make_table(results))
+            results = {"ppl": ppl.item()}
+            if args.output_path is not None:
+                os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+                with open(args.output_path, "w") as f:
+                    json.dump(results, f, indent=2)
+        else:
+            task_names = args.tasks.split(",")
+
+            lm_eval_model = LMEvalAdaptor(args.model_path, model, enc, args.batch_size)
+            results = evaluator.simple_evaluate(
+                model=lm_eval_model,
+                tasks=task_names,
+                batch_size=args.batch_size,
+                no_cache=True,
+                num_fewshot=args.num_fewshot,
+            )
+
+            print(evaluator.make_table(results))
 
         if args.output_path is not None:
             os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
@@ -249,5 +325,5 @@ def main():
                 json.dump(results, f, indent=2)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
