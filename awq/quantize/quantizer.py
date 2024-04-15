@@ -57,7 +57,83 @@ def scale_activations(module):
         set_op_by_name(module, "mlp.act", act)
 
 
+def quantize_nf(x, q_group_size, code, get_scale_zp):
+    org_shape = x.shape
+    if q_group_size > 0:
+        x = x.reshape(-1, q_group_size)
+    max_val_tensor, _ = torch.max(x, dim=1)
+    min_val_tensor, _ = torch.min(x, dim=1)
+    scale = (max_val_tensor - min_val_tensor) / (code[-1] - code[0])
+    zp = code[-1] - max_val_tensor / scale
+    scale = scale.unsqueeze(dim=-1)
+    zp = zp.unsqueeze(dim=-1)
+    q = x / scale + zp
+    # q = q.reshape(-1, 1)
+    # distance = torch.abs(q - code)
+    # idx = torch.argmin(distance, dim=-1)
+    # q = torch.gather(code, -1, idx)
+    mid_data = [(code[i] + code[i + 1]) / 2 for i in range(len(code) - 1)]
+    q_tensor = torch.zeros_like(q)
+    for i in range(len(code)):
+        data = code[i]
+        if i == 0:
+            q_tensor += torch.where(q <= mid_data[i], data, 0)
+        elif i == len(code) - 1:
+            q_tensor += torch.where(q > mid_data[i - 1], data, 0)
+        else:
+            q_tensor += torch.where((mid_data[i - 1] < q) & (q <= mid_data[i]), data, 0)
+    q = q_tensor
+    q = (q - zp) * scale
+    q = q.reshape(org_shape)
+    if get_scale_zp:
+        return q, scale.view(q.shape[0], -1), zp.view(q.shape[0], -1)
+    else:
+        return q
+
+def quantize_nf_sym(x, q_group_size, code, get_scale_zp):
+    org_shape = x.shape
+    if q_group_size > 0:
+        x = x.reshape(-1, q_group_size)
+    max_val_tensor, _ = torch.max(x.abs(), dim=1)
+    scale = max_val_tensor / code[-1]
+    scale = scale.unsqueeze(dim=-1)
+    q = x / scale
+    mid_data = [(code[i] + code[i + 1]) / 2 for i in range(len(code) - 1)]
+    q_tensor = torch.zeros_like(q)
+    for i in range(len(code)):
+        data = code[i]
+        if i == 0:
+            q_tensor += torch.where(q <= mid_data[i], data, 0)
+        elif i == len(code) - 1:
+            q_tensor += torch.where(q > mid_data[i - 1], data, 0)
+        else:
+            q_tensor += torch.where((mid_data[i - 1] < q) & (q <= mid_data[i]), data, 0)
+    q = q_tensor
+    q = q * scale
+    q = q.reshape(org_shape)
+    if get_scale_zp:
+        return q, scale.view(q.shape[0], -1)
+    else:
+        return q
+
+def nf4_quantize(original_func):
+    def wrapper(w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False):
+        code = torch.tensor([
+            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+            0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
+            0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
+            0.7229568362236023, 1.0,
+        ]).to(w.device)
+        if zero_point:
+            return quantize_nf(w, q_group_size, code, get_scale_zp)
+        else:
+            return quantize_nf_sym(w, q_group_size, code, get_scale_zp)
+    return wrapper
+
+
 # core quantization method (simulated quantization)
+@nf4_quantize
 def pseudo_quantize_tensor(
     w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False
 ):
@@ -74,9 +150,10 @@ def pseudo_quantize_tensor(
         max_int = 2**n_bit - 1
         min_int = 0
         scales = (max_val - min_val).clamp(min=1e-5) / max_int
-        zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
+        # zeros = (-torch.round(min_val / scales)).clamp_(min_int, max_int)
+        zeros = - min_val / scales
     else:  # we actually never used this
-        assert min_val is None
+        # assert min_val is None
         max_val = w.abs().amax(dim=1, keepdim=True)
         max_val = max_val.clamp(min=1e-5)
         max_int = 2 ** (n_bit - 1) - 1

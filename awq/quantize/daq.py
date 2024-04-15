@@ -18,7 +18,7 @@ import sys
 
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
-    logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format='%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s')
 
 NF4 = [
@@ -117,7 +117,7 @@ def run_daq(
 
     # solve layer by layer
     layer_queue = queue.Queue()
-    for i in tqdm.tqdm(range(len(layers)), desc="Running AWQ..."):
+    for i in tqdm.tqdm(range(len(layers)), desc="Running DAQ..."):
         layer = layers[i]
         named_linears = get_named_linears(layer)
         layer = layer.cuda()

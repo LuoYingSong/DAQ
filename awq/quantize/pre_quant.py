@@ -82,9 +82,9 @@ def run_awq(
     model, enc,
     w_bit, q_config,
     n_samples=512, seqlen=512,
-    auto_scale=True, mse_range=True,token_size=None,
+    auto_scale=True, mse_range=True, token_size=None,
     # some configs for ablation study
-    calib_data="pileval",
+    calib_data="pileval", use_cali="min-max"
 ):
     from ..utils.calib_data import get_calib_dataset
     from ..utils.module import append_str_prefix, get_op_name
@@ -92,7 +92,7 @@ def run_awq(
     if "bigcode" in str(model.__class__).lower():
         # otherwise attention_mask will always be on cpu.
         model.transformer.bias = model.transformer.bias.to("cuda")
-
+    print("mse range:",mse_range)
     layers = get_blocks(model)
 
     samples = get_calib_dataset(
@@ -190,7 +190,7 @@ def run_awq(
         # Clear GPU memory
         torch.cuda.empty_cache()
 
-        if mse_range:
+        if mse_range and use_cali == 'min-max':
             clip_list = auto_clip_block(
                 layer,
                 w_bit=w_bit,

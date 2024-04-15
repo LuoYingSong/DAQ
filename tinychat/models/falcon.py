@@ -8,8 +8,8 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-import awq_inference_engine
-
+# import awq_inference_engine
+awq_inference_engine = None
 import tinychat.utils.constants
 
 max_batch_size = tinychat.utils.constants.max_batch_size
