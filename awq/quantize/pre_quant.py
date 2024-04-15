@@ -68,7 +68,7 @@ def run_awq(
     model, enc,
     w_bit, q_config,
     n_samples=512, seqlen=512,
-    auto_scale=True, mse_range=True,
+    auto_scale=True, mse_range=True,token_size=None,
     # some configs for ablation study
     calib_data="pileval",
 ):
@@ -81,7 +81,7 @@ def run_awq(
     layers = get_blocks(model)
 
     samples = get_calib_dataset(
-        data=calib_data, tokenizer=enc, n_samples=n_samples, block_size=seqlen)
+        data=calib_data, tokenizer=enc, n_samples=n_samples, block_size=seqlen, token_size=token_size)
     samples = torch.cat(samples, dim=0)
 
     inps = []

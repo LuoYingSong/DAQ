@@ -45,17 +45,15 @@ parser.add_argument('--load_quant', type=str, default=None,
 # apply/save/load awq
 parser.add_argument('--run_awq', action='store_true',
                     help="perform awq search process")
-parser.add_argument('--dump_awq', type=str, default=None,
+parser.add_argument('--dump', type=str, default=None,
                     help="save the awq search results")
 parser.add_argument('--load_awq', type=str, default=None,
                     help="load the awq search results")
-
-parser.add_argument('--run_daq', action='store_true',
-                    help="perform awq search process")
-parser.add_argument('--dump_daq', type=str, default=None,
-                    help="save the awq search results")
 parser.add_argument('--load_daq', type=str, default=None,
                     help="load the awq search results")
+parser.add_argument('--sample', type=int, default=50)
+parser.add_argument('--run_daq', action='store_true',
+                    help="perform awq search process")
 args = parser.parse_args()
 
 max_memory = [v.split(':') for v in (args.max_memory or [])]
@@ -124,7 +122,7 @@ def build_model_and_enc(model_path):
 
         model.eval()
     else:  # fp16 to quantized
-        args.run_awq &= not args.load_awq  # if load_awq, no need to run awq
+        args.run_awq &= not args.load_awq  # if load, no need to run awq
         # Init model on CPU:
         kwargs = {"torch_dtype": torch.float16, "low_cpu_mem_usage": True}
         model = AutoModelForCausalLM.from_pretrained(
@@ -133,32 +131,32 @@ def build_model_and_enc(model_path):
         model.eval()
 
         if args.run_awq:
-            assert args.dump_awq, "Please save the awq results with --dump_awq"
+            assert args.dump, "Please save the awq results with --dump"
 
             awq_results = run_awq(
                 model, enc,
                 w_bit=args.w_bit, q_config=q_config,
-                n_samples=50, seqlen=512,
+                n_samples=50, seqlen=512, token_size=args.sample
             )
-            if args.dump_awq:
-                dirpath = os.path.dirname(args.dump_awq)
+            if args.dump:
+                dirpath = os.path.dirname(args.dump)
                 os.makedirs(dirpath, exist_ok=True)
 
-                torch.save(awq_results, args.dump_awq)
-                print("AWQ results saved at", args.dump_awq)
+                torch.save(awq_results, args.dump)
+                print("AWQ results saved at", args.dump)
         if args.run_daq:
             awq_results = run_daq(
                 model, enc,
                 w_bit=args.w_bit, q_config=q_config,
                 n_samples=50, seqlen=512,
-                hyper_parameters=hyper_parameters
+                hyper_parameters=hyper_parameters, token_size=args.sample
             )
-            if args.dump_daq:
-                dirpath = os.path.dirname(args.dump_daq)
+            if args.dump:
+                dirpath = os.path.dirname(args.dump)
                 os.makedirs(dirpath, exist_ok=True)
 
-                torch.save(awq_results, args.dump_daq)
-                print("AWQ results saved at", args.dump_daq)
+                torch.save(awq_results, args.dump)
+                print("AWQ results saved at", args.dump)
             # exit(0)
 
         if args.load_awq:
@@ -214,8 +212,8 @@ def main():
         print(f"Results {args.output_path} already generated. Overwrite.")
         # exit()
 
-    if args.dump_awq and os.path.exists(args.dump_awq):
-        print(f"Found existing AWQ results {args.dump_awq}, exit.")
+    if args.dump and os.path.exists(args.dump):
+        print(f"Found existing AWQ results {args.dump}, exit.")
         exit()
 
     model, enc = build_model_and_enc(args.model_path)
@@ -232,7 +230,7 @@ def main():
     if args.tasks is not None:
         task_names = args.tasks.split(",")
 
-        lm_eval_model = LMEvalAdaptor(args.model_path, model.cuda(), enc, args.batch_size)
+        lm_eval_model = LMEvalAdaptor(args.model_path, model, enc, args.batch_size)
         results = evaluator.simple_evaluate(
             model=lm_eval_model,
             tasks=task_names,

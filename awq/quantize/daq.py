@@ -14,10 +14,11 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMS
 from .pre_quant import get_blocks, move_embed, get_named_linears
 from ..utils.module import get_op_name, get_op_by_name
 from ..utils.module import append_str_prefix, get_op_name
+import sys
 
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
-logging.basicConfig(level=logging.INFO,
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format='%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s')
 
 NF4 = [
@@ -61,6 +62,7 @@ def run_daq(
         auto_scale=True, mse_range=True,
         # some configs for ablation study
         calib_data="pileval",
+        token_size=None,
         hyper_parameters={}
 ):
     from ..utils.calib_data import get_calib_dataset
@@ -71,7 +73,7 @@ def run_daq(
     layers = get_blocks(model)
 
     samples = get_calib_dataset(
-        data=calib_data, tokenizer=enc, n_samples=n_samples, block_size=seqlen)
+        data=calib_data, tokenizer=enc, n_samples=n_samples, block_size=seqlen, token_size=token_size)
     samples = torch.cat(samples, dim=0)
 
     inps = []
@@ -236,12 +238,13 @@ def daq_auto_scale_block(module, module_kwargs,
             logging.info("old x:%s w:%s",x.shape, fc_w.shape)
             if group > 0:
                 fc_w = fc_w.reshape(-1, group)
-            global bsz, seq
-            if len(x.shape) > 2:
-                bsz, seq, feature = x.shape
-            else:
-                x = x.reshape(bsz, seq, -1)
-            x = x.sum(dim=0)
+            # if len(x.shape) > 2:
+            #     global bsz, seq
+            #     bsz, seq, feature = x.shape
+            # else:
+            #     # x = x.reshape(bsz, seq, -1)
+            #     pass
+            # x = x.sum(dim=0)
             # Step1 初始化scale
             logging.info("new x:%s w:%s",x.shape, fc_w.shape)
             scale, zp = init_zp_scale(allow_data, bins, fc_w)
@@ -373,8 +376,8 @@ def daq_auto_scale_block(module, module_kwargs,
         # scale = k / allow_data[-1]
 
         scale = (max_val_tensor - min_val_tensor) / (allow_data[-1] - allow_data[0])
-        zp = - density * scale
-        # zp = allow_data[-1] - max_val_tensor / scale
+        # zp = - density * scale
+        zp = allow_data[-1] - max_val_tensor / scale
         return scale, zp
 
     def _auto_get_scale(prev_op, layers, inp, module2inspect=None, kwargs={}):

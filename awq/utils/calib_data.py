@@ -2,7 +2,7 @@ import torch
 from datasets import load_dataset
 
 
-def get_calib_dataset(data="pileval", tokenizer=None, n_samples=512, block_size=512):
+def get_calib_dataset(data="pileval", tokenizer=None, n_samples=512, block_size=512, token_size=None):
     if data == "pileval":
         dataset = load_dataset("mit-han-lab/pile-val-backup", split="validation")
     else:
@@ -10,6 +10,7 @@ def get_calib_dataset(data="pileval", tokenizer=None, n_samples=512, block_size=
     dataset = dataset.shuffle(seed=42)
     samples = []
     n_run = 0
+    token_num = 0
     for data in dataset:
         line = data["text"]
         line = line.strip()
@@ -21,8 +22,13 @@ def get_calib_dataset(data="pileval", tokenizer=None, n_samples=512, block_size=
             continue
         samples.append(sample)
         n_run += 1
-        if n_run == n_samples:
-            break
+        if token_size is not None:
+            token_num += sample.shape[1]
+            if token_num >= block_size * token_size:
+                break
+        else:
+            if n_run == n_samples:
+                break
     # now concatenate all samples and split according to block size
     cat_samples = torch.cat(samples, dim=1)
     n_split = cat_samples.shape[1] // block_size
