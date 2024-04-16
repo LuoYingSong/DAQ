@@ -51,7 +51,174 @@ FP4_E2M1_BIT = [-1, -2, -3, -4, -5, -6, -7, 0, 1, 2, 3, 4, 5, 6, 7]
 
 FLOAT_MAPPING = {"nf4": NF4, "fp4": FP4_BNB, "fp4_e2m1_bnb": FP4_BNB, "fp4_e2m1": FP4_E2M1}
 INT_MAPPING = {"nf4": NF4_BIT, "fp4": FP4_BNB_BIT, "fp4_e2m1_bnb": FP4_BNB_BIT, "fp4_e2m1": FP4_E2M1_BIT}
-bsz, seq = None, None
+
+
+def init_zp_scale(allow_data, bins, fc_w):
+    max_val_tensor, _ = torch.max(fc_w, dim=1)
+    min_val_tensor, _ = torch.min(fc_w, dim=1)
+    histogram = torch.zeros((fc_w.shape[0], bins)).cuda()
+
+    for i, channel in enumerate(fc_w):
+        histogram[i] = torch.histc(channel.float(), bins=bins)
+    extended_hist = torch.cat(
+        [torch.zeros(histogram.shape[0], 1).cuda(), histogram, torch.zeros(histogram.shape[0], 1).cuda()], dim=1)
+
+    # 初始化左右游标
+    mode_index = torch.argmax(histogram, dim=1) + 1
+    left_cursor = mode_index.clone()
+    right_cursor = mode_index.clone()
+
+    # 初始化累积直方图
+    accumulated = extended_hist[torch.arange(histogram.shape[0]), mode_index]
+    half_total = histogram.sum(dim=1) / 2
+
+    # 并行搜索
+    while True:
+        move_mask = accumulated < half_total
+        if not move_mask.abs().sum():
+            break
+
+        # 同时更新所有左右游标
+        left_move = extended_hist[torch.arange(histogram.shape[0]), left_cursor - 1]
+        right_move = extended_hist[torch.arange(histogram.shape[0]), right_cursor + 1]
+
+        move_left = (left_move > right_move) & move_mask
+        move_right = ~move_left & move_mask
+
+        can_move_left = (left_cursor > 1) & move_mask
+        can_move_right = (right_cursor < bins) & move_mask
+
+        move_left = move_left & can_move_left | (~can_move_right & move_mask)
+        move_right = move_right & can_move_right | (~can_move_left & move_mask)
+
+        left_cursor = torch.where(move_left, left_cursor - 1, left_cursor)
+        right_cursor = torch.where(move_right, right_cursor + 1, right_cursor)
+
+        # 更新累积直方图
+        accumulated += torch.where(move_left, left_move, right_move)
+
+    # 计算中间点
+    bin_width = (max_val_tensor - min_val_tensor) / bins
+    left_val = min_val_tensor + (left_cursor - 1) * bin_width
+    right_val = min_val_tensor + right_cursor * bin_width
+    density = (left_val + right_val) / 2
+
+    # k = torch.maximum(max_val_tensor - density, density - min_val_tensor)
+    # scale = k / allow_data[-1]
+
+    scale = (max_val_tensor - min_val_tensor) / (allow_data[-1] - allow_data[0])
+    # zp = - density * scale
+    zp = allow_data[-1] - max_val_tensor / scale
+    return scale, zp
+
+
+@torch.no_grad()
+def _search_module_scale(block, linears2scale: list, raw_data, kwargs={}, hyper_parameters={}):
+    # w: co, ci
+    # x: n, ci
+    raw_data = raw_data.to(next(block.parameters()).device)
+    data_type = hyper_parameters['data_types']
+    bins = hyper_parameters['bins']
+    epsilon_org = hyper_parameters['epsilon']
+    alpha_org = hyper_parameters['alpha']
+    num_epoch = hyper_parameters['num_epoch']
+    num_iter = hyper_parameters['num_iter']
+    group = hyper_parameters['group']
+    allow_data = FLOAT_MAPPING[data_type]
+    flag = 0
+    random.seed(2024)
+    best_scales_list = []
+    best_zp_list = []
+    for fc in linears2scale:
+        logging.debug("%s", str(fc))
+        x = raw_data
+        fc_w = fc.weight.data
+        logging.info("old x:%s w:%s",x.shape, fc_w.shape)
+        if group > 0:
+            fc_w = fc_w.reshape(-1, group)
+        # if len(x.shape) > 2:
+        #     global bsz, seq
+        #     bsz, seq, feature = x.shape
+        # else:
+        #     # x = x.reshape(bsz, seq, -1)
+        #     pass
+        # x = x.sum(dim=0)
+        # Step1 初始化scale
+        logging.info("new x:%s w:%s",x.shape, fc_w.shape)
+        scale, zp = init_zp_scale(allow_data, bins, fc_w)
+        rate = 5
+
+        # Step2 调优scale 和 weight
+        org_out = cal_matrix(x, fc.weight.data, group)
+        for i in range(num_epoch):
+            flag += 1
+            min_epsilon = epsilon_org / rate
+            max_epsilon = epsilon_org * rate
+            min_alpha = alpha_org / rate
+            max_alpha = alpha_org * rate
+            for j in range(num_iter):
+                if j % 2:
+                    min_epsilon = 0.9 * min_epsilon
+                    min_alpha = 0.9 * min_alpha
+                    epsilon = min_epsilon
+                    alpha = min_alpha
+                else:
+                    max_epsilon = 1.1 * max_epsilon
+                    max_alpha = 1.1 * max_alpha
+                    epsilon = max_epsilon
+                    alpha = max_alpha
+                mid_loss = get_loss_by_s_and_zp(fc, zp, scale, data_type, org_out, x, group, **kwargs)
+                left_loss = get_loss_by_s_and_zp(fc, zp - epsilon, scale, data_type, org_out, x, group,
+                                                 **kwargs)
+                right_loss = get_loss_by_s_and_zp(fc, zp + epsilon, scale, data_type, org_out, x, group,
+                                                  **kwargs)
+                gradient_sign = torch.sign(right_loss - left_loss)
+                gradient_sign = torch.where(torch.logical_or(left_loss < mid_loss, right_loss < mid_loss),
+                                            gradient_sign, 0)
+                # print(1,torch.cuda.memory_allocated() / (1024 * 1024))
+
+                zp = zp - alpha * gradient_sign
+
+                del mid_loss, left_loss, right_loss
+
+                mid_loss = get_loss_by_s_and_zp(fc, zp, scale, data_type, org_out, x, group, **kwargs)
+                # print(2,torch.cuda.memory_allocated()/ (1024 * 1024))
+
+                left_scale = scale * (1 - epsilon)
+                left_scale_loss = get_loss_by_s_and_zp(fc, zp, left_scale, data_type, org_out, x, group,
+                                                       **kwargs)
+                # print(3,torch.cuda.memory_allocated()/ (1024 * 1024))
+
+                right_scale = scale * (1 + epsilon)
+                right_scale_loss = get_loss_by_s_and_zp(fc, zp, right_scale, data_type, org_out, x, group,
+                                                        **kwargs)
+                # print(4,torch.cuda.memory_allocated()/ (1024 * 1024))
+                gradient_scale_sign = torch.sign(right_scale_loss - left_scale_loss)
+                gradient_scale_sign = torch.where(
+                    torch.logical_or(left_scale_loss < mid_loss, right_scale_loss < mid_loss),
+                    gradient_scale_sign, 0)
+                new_scale = torch.where(left_scale_loss < right_scale_loss, left_scale, right_scale)
+                new_scale = torch.where(gradient_scale_sign != 0, new_scale, scale)
+
+                logging.debug("mid_loss sum: %s, alpha: %s, epsilon: %s", mid_loss.sum(), alpha, epsilon)
+
+                scale = new_scale
+                if gradient_sign.abs().sum() == 0 and gradient_scale_sign.abs().sum() == 0:
+                    flag += 1
+                    if flag > 5:
+                        break
+                else:
+                    flag = 0
+                del mid_loss, left_scale_loss, right_scale_loss, left_scale, right_scale, gradient_scale_sign, gradient_sign
+
+        best_scales = scale.view(-1).detach().cpu()
+        best_zp = zp.view(-1).detach().cpu()
+        assert torch.isnan(best_scales).sum() == 0, best_scales
+        assert torch.isnan(best_zp).sum() == 0, best_zp
+        best_scales_list.append(best_scales)
+        best_zp_list.append(zp)
+
+    return best_scales_list, best_zp_list
 
 
 @torch.no_grad()
@@ -214,171 +381,7 @@ def daq_auto_scale_block(module, module_kwargs,
         module_kwargs.pop("use_cache")
 
     # find the best scale ratio
-    @torch.no_grad()
-    def _search_module_scale(block, linears2scale: list, raw_data, kwargs={}):
-        # w: co, ci
-        # x: n, ci
-        raw_data = raw_data.to(next(block.parameters()).device)
-        data_type = hyper_parameters['data_types']
-        bins = hyper_parameters['bins']
-        epsilon_org = hyper_parameters['epsilon']
-        alpha_org = hyper_parameters['alpha']
-        num_epoch = hyper_parameters['num_epoch']
-        num_iter = hyper_parameters['num_iter']
-        group = hyper_parameters['group']
-        allow_data = FLOAT_MAPPING[data_type]
-        flag = 0
-        random.seed(2024)
-        best_scales_list = []
-        best_zp_list = []
-        for fc in linears2scale:
-            logging.debug("%s", str(fc))
-            x = raw_data
-            fc_w = fc.weight.data
-            logging.info("old x:%s w:%s",x.shape, fc_w.shape)
-            if group > 0:
-                fc_w = fc_w.reshape(-1, group)
-            # if len(x.shape) > 2:
-            #     global bsz, seq
-            #     bsz, seq, feature = x.shape
-            # else:
-            #     # x = x.reshape(bsz, seq, -1)
-            #     pass
-            # x = x.sum(dim=0)
-            # Step1 初始化scale
-            logging.info("new x:%s w:%s",x.shape, fc_w.shape)
-            scale, zp = init_zp_scale(allow_data, bins, fc_w)
-            rate = 5
 
-            # Step2 调优scale 和 weight
-            org_out = cal_matrix(x, fc.weight.data, group)
-            for i in range(num_epoch):
-                flag += 1
-                min_epsilon = epsilon_org / rate
-                max_epsilon = epsilon_org * rate
-                min_alpha = alpha_org / rate
-                max_alpha = alpha_org * rate
-                for j in range(num_iter):
-                    if j % 2:
-                        min_epsilon = 0.9 * min_epsilon
-                        min_alpha = 0.9 * min_alpha
-                        epsilon = min_epsilon
-                        alpha = min_alpha
-                    else:
-                        max_epsilon = 1.1 * max_epsilon
-                        max_alpha = 1.1 * max_alpha
-                        epsilon = max_epsilon
-                        alpha = max_alpha
-                    mid_loss = get_loss_by_s_and_zp(fc, zp, scale, data_type, org_out, x, group, **kwargs)
-                    left_loss = get_loss_by_s_and_zp(fc, zp - epsilon, scale, data_type, org_out, x, group,
-                                                     **kwargs)
-                    right_loss = get_loss_by_s_and_zp(fc, zp + epsilon, scale, data_type, org_out, x, group,
-                                                      **kwargs)
-                    gradient_sign = torch.sign(right_loss - left_loss)
-                    gradient_sign = torch.where(torch.logical_or(left_loss < mid_loss, right_loss < mid_loss),
-                                                gradient_sign, 0)
-                    # print(1,torch.cuda.memory_allocated() / (1024 * 1024))
-
-                    zp = zp - alpha * gradient_sign
-
-                    del mid_loss, left_loss, right_loss
-
-                    mid_loss = get_loss_by_s_and_zp(fc, zp, scale, data_type, org_out, x, group, **kwargs)
-                    # print(2,torch.cuda.memory_allocated()/ (1024 * 1024))
-
-                    left_scale = scale * (1 - epsilon)
-                    left_scale_loss = get_loss_by_s_and_zp(fc, zp, left_scale, data_type, org_out, x, group,
-                                                           **kwargs)
-                    # print(3,torch.cuda.memory_allocated()/ (1024 * 1024))
-
-                    right_scale = scale * (1 + epsilon)
-                    right_scale_loss = get_loss_by_s_and_zp(fc, zp, right_scale, data_type, org_out, x, group,
-                                                            **kwargs)
-                    # print(4,torch.cuda.memory_allocated()/ (1024 * 1024))
-                    gradient_scale_sign = torch.sign(right_scale_loss - left_scale_loss)
-                    gradient_scale_sign = torch.where(
-                        torch.logical_or(left_scale_loss < mid_loss, right_scale_loss < mid_loss),
-                        gradient_scale_sign, 0)
-                    new_scale = torch.where(left_scale_loss < right_scale_loss, left_scale, right_scale)
-                    new_scale = torch.where(gradient_scale_sign != 0, new_scale, scale)
-
-                    logging.debug("mid_loss sum: %s, alpha: %s, epsilon: %s", mid_loss.sum(), alpha, epsilon)
-
-                    scale = new_scale
-                    if gradient_sign.abs().sum() == 0 and gradient_scale_sign.abs().sum() == 0:
-                        flag += 1
-                        if flag > 5:
-                            break
-                    else:
-                        flag = 0
-                    del mid_loss, left_scale_loss, right_scale_loss, left_scale, right_scale, gradient_scale_sign, gradient_sign
-
-            best_scales = scale.view(-1).detach().cpu()
-            best_zp = zp.view(-1).detach().cpu()
-            assert torch.isnan(best_scales).sum() == 0, best_scales
-            assert torch.isnan(best_zp).sum() == 0, best_zp
-            best_scales_list.append(best_scales)
-            best_zp_list.append(zp)
-
-        return best_scales_list, best_zp_list
-
-    def init_zp_scale(allow_data, bins, fc_w):
-        max_val_tensor, _ = torch.max(fc_w, dim=1)
-        min_val_tensor, _ = torch.min(fc_w, dim=1)
-        histogram = torch.zeros((fc_w.shape[0], bins)).cuda()
-
-        for i, channel in enumerate(fc_w):
-            histogram[i] = torch.histc(channel.float(), bins=bins)
-        extended_hist = torch.cat(
-            [torch.zeros(histogram.shape[0], 1).cuda(), histogram, torch.zeros(histogram.shape[0], 1).cuda()], dim=1)
-
-        # 初始化左右游标
-        mode_index = torch.argmax(histogram, dim=1) + 1
-        left_cursor = mode_index.clone()
-        right_cursor = mode_index.clone()
-
-        # 初始化累积直方图
-        accumulated = extended_hist[torch.arange(histogram.shape[0]), mode_index]
-        half_total = histogram.sum(dim=1) / 2
-
-        # 并行搜索
-        while True:
-            move_mask = accumulated < half_total
-            if not move_mask.abs().sum():
-                break
-
-            # 同时更新所有左右游标
-            left_move = extended_hist[torch.arange(histogram.shape[0]), left_cursor - 1]
-            right_move = extended_hist[torch.arange(histogram.shape[0]), right_cursor + 1]
-
-            move_left = (left_move > right_move) & move_mask
-            move_right = ~move_left & move_mask
-
-            can_move_left = (left_cursor > 1) & move_mask
-            can_move_right = (right_cursor < bins) & move_mask
-
-            move_left = move_left & can_move_left | (~can_move_right & move_mask)
-            move_right = move_right & can_move_right | (~can_move_left & move_mask)
-
-            left_cursor = torch.where(move_left, left_cursor - 1, left_cursor)
-            right_cursor = torch.where(move_right, right_cursor + 1, right_cursor)
-
-            # 更新累积直方图
-            accumulated += torch.where(move_left, left_move, right_move)
-
-        # 计算中间点
-        bin_width = (max_val_tensor - min_val_tensor) / bins
-        left_val = min_val_tensor + (left_cursor - 1) * bin_width
-        right_val = min_val_tensor + right_cursor * bin_width
-        density = (left_val + right_val) / 2
-
-        # k = torch.maximum(max_val_tensor - density, density - min_val_tensor)
-        # scale = k / allow_data[-1]
-
-        scale = (max_val_tensor - min_val_tensor) / (allow_data[-1] - allow_data[0])
-        # zp = - density * scale
-        zp = allow_data[-1] - max_val_tensor / scale
-        return scale, zp
 
     def _auto_get_scale(prev_op, layers, inp, module2inspect=None, kwargs={}):
         # module2inspect: if given, we will check the output diff of this module instead of layers
@@ -386,7 +389,7 @@ def daq_auto_scale_block(module, module_kwargs,
             assert len(layers) == 1
             module2inspect = layers[0]
 
-        scales, zp = _search_module_scale(module2inspect, layers, inp, kwargs)
+        scales, zp = _search_module_scale(module2inspect, layers, inp, kwargs, hyper_parameters)
         # scales = scales.detach().cpu()
         # zp = zp.detach().cpu()
         # prev_op_name, [layer_name], scale
