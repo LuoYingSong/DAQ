@@ -12,9 +12,13 @@ from accelerate import (
 )
 from accelerate.utils.modeling import get_balanced_memory
 from awq.utils.parallel import auto_parallel
-from awq.quantize.pre_quant import run_awq, apply_awq
+from awq.quantize.pre_quant import (
+    run_awq,
+    apply_awq,
+    apply_scale,
+    apply_clip
+)
 from awq.quantize.daq import run_daq, daq_apply_scale
-from awq.quantize.quantizer import pseudo_quantize_model_weight, real_quantize_model_weight
 from awq.quantize.quantizer import (
     pseudo_quantize_model_weight,
     real_quantize_model_weight,
@@ -31,6 +35,8 @@ parser.add_argument("--model_path", type=str, help="path of the hf model")
 parser.add_argument("--batch_size", type=int, default=1, help="batch size")
 parser.add_argument("--tasks", default=None, type=str)
 parser.add_argument("--output_path", default=None, type=str)
+parser.add_argument("--data_type", default='int', type=str)  # quantization data type for awq only.
+parser.add_argument("--calibration", default='min-max', type=str)  # quantization calibration for awq only
 parser.add_argument("--num_fewshot", type=int, default=0)
 # model config
 parser.add_argument("--parallel", action="store_true", help="enable model parallelism")
@@ -81,6 +87,7 @@ if args.auto_parallel:
 q_config = {
     "zero_point": not args.no_zero_point,  # by default True
     "q_group_size": args.q_group_size,  # whether to use group quantization
+    "data_type": args.data_type
 }
 print("Quantization config:", q_config)
 
@@ -176,7 +183,8 @@ def build_model_and_enc(model_path):
             awq_results = run_awq(
                 model, enc,
                 w_bit=args.w_bit, q_config=q_config,
-                n_samples=50, seqlen=512, token_size=args.sample
+                n_samples=50, seqlen=512, token_size=args.sample,
+                use_cali=args.calibration, hyper_parameters=hyper_parameters   # hyper_parameters for calibration is awq
             )
             if args.dump:
                 dirpath = os.path.dirname(args.dump)
@@ -202,21 +210,30 @@ def build_model_and_enc(model_path):
         if args.load_awq:
             print("Loading pre-computed AWQ results from", args.load_awq)
             awq_results = torch.load(args.load_awq, map_location="cpu")
-            apply_awq(model, awq_results)
+            apply_scale(model, awq_results["scale"])
+            if args.calibration.lower().strip() == 'min-max':
+                apply_clip(model, awq_results["clip"])
+            elif args.calibration.lower().strip() == 'daq':
+                pass  # the daq do not need to clip
+            else:
+                raise ValueError(f"Unknown {args.calibration} quantization calibration. min-max or daq is supported")
 
         if args.load_daq:
             print("Loading pre-computed daq results from", args.load_daq)
             awq_results = torch.load(args.load_daq, map_location="cpu")
-            daq_apply_scale(model, awq_results['scale'], hyper_parameters['data_types'])
+            daq_apply_scale(model, awq_results['daq'], hyper_parameters['data_types'])  # fake quantization
 
         # weight quantization
         if args.w_bit is not None and (args.load_awq or args.run_awq):
-            if args.q_backend == "fake":
-                assert args.dump_quant is None, \
-                    "Need to use real quantization to dump quantized weights"
-                pseudo_quantize_model_weight(
-                    model, w_bit=args.w_bit, q_config=q_config
-                )
+            if args.q_backend == "fake":  # fake quantization in awq
+                if args.calibration == 'daq':
+                    daq_apply_scale(model, awq_results['daq'], hyper_parameters['data_types'])
+                elif args.calibration == 'min-max':
+                    assert args.dump_quant is None, \
+                        "Need to use real quantization to dump quantized weights"
+                    pseudo_quantize_model_weight(
+                        model, w_bit=args.w_bit, q_config=q_config
+                    )
             elif args.q_backend == "real":  # real quantization
                 real_quantize_model_weight(model, w_bit=args.w_bit, q_config=q_config)
                 if args.dump_quant:
@@ -261,7 +278,7 @@ def main():
         print(f"Results {args.output_path} already generated. Overwrite.")
         # exit()
 
-    if args.dump and os.path.exists(args.dump):
+    if args.dump and os.path.exists(args.dump) and not args.dump.endswith("test.pt"):
         print(f"Found existing AWQ results {args.dump}, exit.")
         exit()
 

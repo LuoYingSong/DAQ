@@ -90,6 +90,7 @@ def quantize_nf(x, q_group_size, code, get_scale_zp):
     else:
         return q
 
+
 def quantize_nf_sym(x, q_group_size, code, get_scale_zp):
     org_shape = x.shape
     if q_group_size > 0:
@@ -117,25 +118,28 @@ def quantize_nf_sym(x, q_group_size, code, get_scale_zp):
         return q
 
 def nf4_quantize(original_func):
-    def wrapper(w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False):
-        code = torch.tensor([
-            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-            0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
-            0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
-            0.7229568362236023, 1.0,
-        ]).to(w.device)
-        if zero_point:
-            return quantize_nf(w, q_group_size, code, get_scale_zp)
+    def wrapper(w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False, data_type='int'):
+        if data_type == 'int':
+            return pseudo_quantize_tensor(w, n_bit, zero_point, q_group_size, inplace, get_scale_zp, data_type)
         else:
-            return quantize_nf_sym(w, q_group_size, code, get_scale_zp)
+            code = torch.tensor([
+                -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+                -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+                0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
+                0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
+                0.7229568362236023, 1.0,
+            ]).to(w.device)
+            if zero_point:
+                return quantize_nf(w, q_group_size, code, get_scale_zp)
+            else:
+                return quantize_nf_sym(w, q_group_size, code, get_scale_zp)
     return wrapper
 
 
 # core quantization method (simulated quantization)
-@nf4_quantize
+@nf4_quantize  # the decorator hack the original logic, pls refer to function nf4_quantize
 def pseudo_quantize_tensor(
-    w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False
+    w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False, data_type='int'
 ):
     org_w_shape = w.shape
     if q_group_size > 0:

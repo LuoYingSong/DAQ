@@ -84,7 +84,8 @@ def run_awq(
     n_samples=512, seqlen=512,
     auto_scale=True, mse_range=True, token_size=None,
     # some configs for ablation study
-    calib_data="pileval", use_cali="min-max"
+    calib_data="pileval", use_cali="min-max",
+    hyper_parameters=None
 ):
     from ..utils.calib_data import get_calib_dataset
     from ..utils.module import append_str_prefix, get_op_name
@@ -137,6 +138,7 @@ def run_awq(
     awq_results = {
         "scale": [],
         "clip": [],
+        "daq": []
     }
 
     # solve layer by layer
@@ -189,19 +191,34 @@ def run_awq(
 
         # Clear GPU memory
         torch.cuda.empty_cache()
-
-        if mse_range and use_cali == 'min-max':
-            clip_list = auto_clip_block(
-                layer,
-                w_bit=w_bit,
-                q_config=q_config,
-                input_feat=input_feat,
+        if use_cali == 'min-max':
+            if mse_range:
+                clip_list = auto_clip_block(
+                    layer,
+                    w_bit=w_bit,
+                    q_config=q_config,
+                    input_feat=input_feat,
+                )
+                apply_clip(layer, clip_list)
+                # append prefix to make names global
+                awq_results["clip"] += append_str_prefix(
+                    clip_list, get_op_name(model, layer) + "."
+                )
+        elif use_cali == 'daq' and q_config.get('data_type') == 'nf':
+            from .daq import search_module_scale, daq_apply_scale, daq_auto_scale_block
+            layer = layer.cuda()
+            scales_list = daq_auto_scale_block(
+                layer, layer_kwargs,
+                w_bit=w_bit, q_config=q_config,
+                input_feat=input_feat, hyper_parameters=hyper_parameters
             )
-            apply_clip(layer, clip_list)
+            daq_apply_scale(layer, scales_list, hyper_parameters['data_types'], input_feat_dict=input_feat)
+            layer = layer.cpu()
             # append prefix to make names global
-            awq_results["clip"] += append_str_prefix(
-                clip_list, get_op_name(model, layer) + "."
-            )
+            awq_results["daq"] += append_str_prefix(scales_list, get_op_name(model, layer) + ".")
+        else:
+            raise ValueError(f"Not support {q_config.get('data_type')} format using {use_cali}"
+                             f" quantization calibration")
 
         layer = layer.cpu()
         # Haotian: check activation replacement

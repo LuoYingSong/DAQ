@@ -113,7 +113,7 @@ def init_zp_scale(allow_data, bins, fc_w):
 
 
 @torch.no_grad()
-def _search_module_scale(block, linears2scale: list, raw_data, kwargs={}, hyper_parameters={}):
+def search_module_scale(block, linears2scale: list, raw_data, kwargs={}, hyper_parameters={}):
     # w: co, ci
     # x: n, ci
     raw_data = raw_data.to(next(block.parameters()).device)
@@ -279,7 +279,7 @@ def run_daq(
     torch.cuda.empty_cache()
 
     awq_results = {
-        "scale": []
+        "daq": []
     }
 
     # solve layer by layer
@@ -352,7 +352,7 @@ def process_one_layer(awq_results, hyper_parameters, input_feat, layer, layer_kw
     )
     daq_apply_scale(layer, scales_list, hyper_parameters['data_types'], input_feat_dict=input_feat)
     # append prefix to make names global
-    awq_results["scale"] += append_str_prefix(scales_list, get_op_name(model, layer) + ".")
+    awq_results["daq"] += append_str_prefix(scales_list, get_op_name(model, layer) + ".")
     # Clear GPU memory
     torch.cuda.empty_cache()
     layer = layer.cpu()
@@ -389,7 +389,7 @@ def daq_auto_scale_block(module, module_kwargs,
             assert len(layers) == 1
             module2inspect = layers[0]
 
-        scales, zp = _search_module_scale(module2inspect, layers, inp, kwargs, hyper_parameters)
+        scales, zp = search_module_scale(module2inspect, layers, inp, kwargs, hyper_parameters)
         # scales = scales.detach().cpu()
         # zp = zp.detach().cpu()
         # prev_op_name, [layer_name], scale

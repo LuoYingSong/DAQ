@@ -83,7 +83,7 @@ def scale_gelu_fc(gelu, fc, scales):
 
 
 @torch.no_grad()
-def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
+def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat, use_cali='min-max'):
     from .quantizer import pseudo_quantize_tensor
 
     # firstly, get the weight quantize function
@@ -124,7 +124,6 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat):
         history = []
 
         org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
-        # print(linears2scale)
         for ratio in range(n_grid):
             ratio = ratio * 1 / n_grid
             scales = x_max.pow(ratio).clamp(min=1e-4).view(-1)
