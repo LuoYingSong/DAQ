@@ -15,6 +15,8 @@ from .pre_quant import get_blocks, move_embed, get_named_linears
 from ..utils.module import get_op_name, get_op_by_name
 from ..utils.module import append_str_prefix, get_op_name
 import sys
+from scipy.stats import gaussian_kde
+import numpy as np
 
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
@@ -53,62 +55,135 @@ FLOAT_MAPPING = {"nf4": NF4, "fp4": FP4_BNB, "fp4_e2m1_bnb": FP4_BNB, "fp4_e2m1"
 INT_MAPPING = {"nf4": NF4_BIT, "fp4": FP4_BNB_BIT, "fp4_e2m1_bnb": FP4_BNB_BIT, "fp4_e2m1": FP4_E2M1_BIT}
 
 
+def find_density_centers_old(data):
+    """
+    对输入的2维Tensor的每一行计算密度中心点。
+    使用高斯核密度估计来找到每行的密度最大值位置。
+
+    参数:
+        data (torch.Tensor): 一个2维的Tensor，大小为(n_samples, n_features)
+
+    返回:
+        torch.Tensor: 一个1维的Tensor，包含每一行的密度中心点。
+    """
+    # 确保输入是float32或float64类型，因为gaussian_kde需要这样的输入
+    if data.dtype not in [torch.float32, torch.float64]:
+        data = data.float()
+
+    # 初始化存储密度中心点的数组
+    density_centers = []
+
+    # 将Tensor转换为NumPy数组，因为gaussian_kde使用NumPy数组
+    data_np = data.detach().cpu().numpy()
+
+    # 为每一行数据计算密度中心点
+    for row in tqdm.tqdm(data_np):
+        # 创建KDE对象
+        kde = gaussian_kde(row)
+        # 定义一个用于评估的点范围
+        x = np.linspace(row.min(), row.max(), 1000)
+        kde_values = kde(x)
+        # 寻找密度最大的点
+        max_density_x = x[np.argmax(kde_values)]
+        density_centers.append(max_density_x)
+
+    # 将列表转换回PyTorch Tensor并返回
+    return torch.tensor(density_centers)
+
+
+def simple_kde(data, bandwidth=0.1):
+    if len(data.shape) > 1:
+        raise ValueError("Data should be a 1D tensor.")
+
+    data = data.unsqueeze(0)  # 将数据转换为[1, N]形状
+
+    # 创建一个用于评估密度的点范围
+    x = torch.linspace(data.min(), data.max(), 1000).to(data.device)
+    x = x.unsqueeze(1)  # 将x转换为[1000, 1]形状以支持广播
+
+    # 计算KDE
+    kde_values = torch.exp(-0.5 * ((x - data) / bandwidth) ** 2).mean(dim=1) / (bandwidth * np.sqrt(2 * np.pi))
+
+    # 计算加权平均以确定密度中心
+    weighted_sum = (x.squeeze() * kde_values).sum()
+    total_weight = kde_values.sum()
+
+    density_center = weighted_sum / total_weight
+
+    return density_center.item()
+
 def init_zp_scale(allow_data, bins, fc_w):
     max_val_tensor, _ = torch.max(fc_w, dim=1)
     min_val_tensor, _ = torch.min(fc_w, dim=1)
-    histogram = torch.zeros((fc_w.shape[0], bins)).cuda()
+    # histogram = torch.zeros((fc_w.shape[0], bins)).cuda()
+    #
+    # for i, channel in enumerate(fc_w):
+    #     histogram[i] = torch.histc(channel.float(), bins=bins)
+    # extended_hist = torch.cat(
+    #     [torch.zeros(histogram.shape[0], 1).cuda(), histogram, torch.zeros(histogram.shape[0], 1).cuda()], dim=1)
+    #
+    # # 初始化左右游标
+    # mode_index = torch.argmax(histogram, dim=1) + 1
+    # left_cursor = mode_index.clone()
+    # right_cursor = mode_index.clone()
+    #
+    # # 初始化累积直方图
+    # accumulated = extended_hist[torch.arange(histogram.shape[0]), mode_index]
+    # half_total = histogram.sum(dim=1) * 0.95
+    #
+    # # 并行搜索
+    # while True:
+    #     move_mask = accumulated < half_total
+    #     if not move_mask.abs().sum():
+    #         break
+    #
+    #     # 同时更新所有左右游标
+    #     left_move = extended_hist[torch.arange(histogram.shape[0]), left_cursor - 1]
+    #     right_move = extended_hist[torch.arange(histogram.shape[0]), right_cursor + 1]
+    #
+    #     move_left = (left_move > right_move) & move_mask
+    #     move_right = ~move_left & move_mask
+    #
+    #     can_move_left = (left_cursor > 1) & move_mask
+    #     can_move_right = (right_cursor < bins) & move_mask
+    #
+    #     move_left = move_left & can_move_left | (~can_move_right & move_mask)
+    #     move_right = move_right & can_move_right | (~can_move_left & move_mask)
+    #
+    #     left_cursor = torch.where(move_left, left_cursor - 1, left_cursor)
+    #     right_cursor = torch.where(move_right, right_cursor + 1, right_cursor)
+    #
+    #     # 更新累积直方图
+    #     accumulated += torch.where(move_left, left_move, right_move)
+    #
+    # # 计算中间点
+    # bin_width = (max_val_tensor - min_val_tensor) / bins
+    # left_val = min_val_tensor + (left_cursor - 1) * bin_width
+    # right_val = min_val_tensor + right_cursor * bin_width
+    # density = (left_val + right_val) / 2
+    lower_quantile = torch.quantile(fc_w.float(), 0.025, dim=1)
+    upper_quantile = torch.quantile(fc_w.float(), 0.975, dim=1)
 
+    # 计算中点作为density
+    # density = (lower_quantile + upper_quantile) / 2
+    density = torch.zeros(fc_w.shape[0]).cuda()
     for i, channel in enumerate(fc_w):
-        histogram[i] = torch.histc(channel.float(), bins=bins)
-    extended_hist = torch.cat(
-        [torch.zeros(histogram.shape[0], 1).cuda(), histogram, torch.zeros(histogram.shape[0], 1).cuda()], dim=1)
+        density[i] = simple_kde(channel.float())
+    # density = find_density_centers(fc_w)
+    density = density.half()
 
-    # 初始化左右游标
-    mode_index = torch.argmax(histogram, dim=1) + 1
-    left_cursor = mode_index.clone()
-    right_cursor = mode_index.clone()
+    k = torch.maximum(max_val_tensor - density, density - min_val_tensor) * .90
+    scale = k / allow_data[-1]
+    # print(scale)
+    # scale = (max_val_tensor - min_val_tensor) / (allow_data[-1] - allow_data[0])
 
-    # 初始化累积直方图
-    accumulated = extended_hist[torch.arange(histogram.shape[0]), mode_index]
-    half_total = histogram.sum(dim=1) / 2
-
-    # 并行搜索
-    while True:
-        move_mask = accumulated < half_total
-        if not move_mask.abs().sum():
-            break
-
-        # 同时更新所有左右游标
-        left_move = extended_hist[torch.arange(histogram.shape[0]), left_cursor - 1]
-        right_move = extended_hist[torch.arange(histogram.shape[0]), right_cursor + 1]
-
-        move_left = (left_move > right_move) & move_mask
-        move_right = ~move_left & move_mask
-
-        can_move_left = (left_cursor > 1) & move_mask
-        can_move_right = (right_cursor < bins) & move_mask
-
-        move_left = move_left & can_move_left | (~can_move_right & move_mask)
-        move_right = move_right & can_move_right | (~can_move_left & move_mask)
-
-        left_cursor = torch.where(move_left, left_cursor - 1, left_cursor)
-        right_cursor = torch.where(move_right, right_cursor + 1, right_cursor)
-
-        # 更新累积直方图
-        accumulated += torch.where(move_left, left_move, right_move)
-
-    # 计算中间点
-    bin_width = (max_val_tensor - min_val_tensor) / bins
-    left_val = min_val_tensor + (left_cursor - 1) * bin_width
-    right_val = min_val_tensor + right_cursor * bin_width
-    density = (left_val + right_val) / 2
-
-    # k = torch.maximum(max_val_tensor - density, density - min_val_tensor)
-    # scale = k / allow_data[-1]
-
-    scale = (max_val_tensor - min_val_tensor) / (allow_data[-1] - allow_data[0])
-    # zp = - density * scale
-    zp = allow_data[-1] - max_val_tensor / scale
+    # max_val_tensor, _ = torch.max(fc_w.abs(), dim=1)
+    # scale = (max_val_tensor) / allow_data[-1]
+    # print(scale)
+    zp = - density / scale
+    # zp = allow_data[-1] - max_val_tensor / scale
+    # print(zp)
+    # zp = torch.zeros_like(scale, dtype=torch.float16)
     return scale, zp
 
 
@@ -117,14 +192,15 @@ def search_module_scale(block, linears2scale: list, raw_data, kwargs={}, hyper_p
     # w: co, ci
     # x: n, ci
     raw_data = raw_data.to(next(block.parameters()).device)
-    data_type = hyper_parameters['data_types']
+    data_types = hyper_parameters['data_types']
+    code = torch.Tensor(FLOAT_MAPPING[data_types]).to(next(block.parameters()).device)
     bins = hyper_parameters['bins']
     epsilon_org = hyper_parameters['epsilon']
     alpha_org = hyper_parameters['alpha']
     num_epoch = hyper_parameters['num_epoch']
     num_iter = hyper_parameters['num_iter']
     group = hyper_parameters['group']
-    allow_data = FLOAT_MAPPING[data_type]
+    # allow_data = FLOAT_MAPPING[code]
     flag = 0
     random.seed(2024)
     best_scales_list = []
@@ -133,7 +209,7 @@ def search_module_scale(block, linears2scale: list, raw_data, kwargs={}, hyper_p
         logging.debug("%s", str(fc))
         x = raw_data
         fc_w = fc.weight.data
-        logging.info("old x:%s w:%s",x.shape, fc_w.shape)
+        logging.info("Act. shape:%s Weight shape:%s",x.shape, fc_w.shape)
         if group > 0:
             fc_w = fc_w.reshape(-1, group)
         # if len(x.shape) > 2:
@@ -144,12 +220,14 @@ def search_module_scale(block, linears2scale: list, raw_data, kwargs={}, hyper_p
         #     pass
         # x = x.sum(dim=0)
         # Step1 初始化scale
-        logging.info("new x:%s w:%s",x.shape, fc_w.shape)
-        scale, zp = init_zp_scale(allow_data, bins, fc_w)
+        logging.debug("new x:%s w:%s",x.shape, fc_w.shape)
+        scale, zp = init_zp_scale(code, bins, fc_w)
         rate = 5
 
         # Step2 调优scale 和 weight
         org_out = cal_matrix(x, fc.weight.data, group)
+        init_loss = get_loss_by_s_and_zp(fc, zp, scale, code, org_out, x, group, **kwargs)
+        logging.info("init loss: %s", init_loss.sum())
         for i in range(num_epoch):
             flag += 1
             min_epsilon = epsilon_org / rate
@@ -167,10 +245,10 @@ def search_module_scale(block, linears2scale: list, raw_data, kwargs={}, hyper_p
                     max_alpha = 1.1 * max_alpha
                     epsilon = max_epsilon
                     alpha = max_alpha
-                mid_loss = get_loss_by_s_and_zp(fc, zp, scale, data_type, org_out, x, group, **kwargs)
-                left_loss = get_loss_by_s_and_zp(fc, zp - epsilon, scale, data_type, org_out, x, group,
+                mid_loss = get_loss_by_s_and_zp(fc, zp, scale, code, org_out, x, group, **kwargs)
+                left_loss = get_loss_by_s_and_zp(fc, zp - epsilon, scale, code, org_out, x, group,
                                                  **kwargs)
-                right_loss = get_loss_by_s_and_zp(fc, zp + epsilon, scale, data_type, org_out, x, group,
+                right_loss = get_loss_by_s_and_zp(fc, zp + epsilon, scale, code, org_out, x, group,
                                                   **kwargs)
                 gradient_sign = torch.sign(right_loss - left_loss)
                 gradient_sign = torch.where(torch.logical_or(left_loss < mid_loss, right_loss < mid_loss),
@@ -181,16 +259,16 @@ def search_module_scale(block, linears2scale: list, raw_data, kwargs={}, hyper_p
 
                 del mid_loss, left_loss, right_loss
 
-                mid_loss = get_loss_by_s_and_zp(fc, zp, scale, data_type, org_out, x, group, **kwargs)
+                mid_loss = get_loss_by_s_and_zp(fc, zp, scale, code, org_out, x, group, **kwargs)
                 # print(2,torch.cuda.memory_allocated()/ (1024 * 1024))
 
                 left_scale = scale * (1 - epsilon)
-                left_scale_loss = get_loss_by_s_and_zp(fc, zp, left_scale, data_type, org_out, x, group,
+                left_scale_loss = get_loss_by_s_and_zp(fc, zp, left_scale, code, org_out, x, group,
                                                        **kwargs)
                 # print(3,torch.cuda.memory_allocated()/ (1024 * 1024))
 
                 right_scale = scale * (1 + epsilon)
-                right_scale_loss = get_loss_by_s_and_zp(fc, zp, right_scale, data_type, org_out, x, group,
+                right_scale_loss = get_loss_by_s_and_zp(fc, zp, right_scale, code, org_out, x, group,
                                                         **kwargs)
                 # print(4,torch.cuda.memory_allocated()/ (1024 * 1024))
                 gradient_scale_sign = torch.sign(right_scale_loss - left_scale_loss)
@@ -210,7 +288,8 @@ def search_module_scale(block, linears2scale: list, raw_data, kwargs={}, hyper_p
                 else:
                     flag = 0
                 del mid_loss, left_scale_loss, right_scale_loss, left_scale, right_scale, gradient_scale_sign, gradient_sign
-
+        opt_loss = get_loss_by_s_and_zp(fc, zp, scale, code, org_out, x, group, **kwargs)
+        logging.info("Final loss: %s", opt_loss.sum())
         best_scales = scale.view(-1).detach().cpu()
         best_zp = zp.view(-1).detach().cpu()
         assert torch.isnan(best_scales).sum() == 0, best_scales
@@ -607,10 +686,10 @@ def daq_auto_scale_block(module, module_kwargs,
     return scales_list
 
 
-def get_loss_by_s_and_zp(module, zp, s, data_type, org_out, input_data, group=-1, **kwargs):
+def get_loss_by_s_and_zp(module, zp, s, code, org_out, input_data, group=-1, **kwargs):
     org_w = module.weight.data
     old_shape = org_w.shape
-    now_w = _daq_qdq_4bit(org_w, s, zp, data_type, group).reshape(*old_shape)
+    now_w = _daq_qdq_4bit(org_w, s, zp, code, group).reshape(*old_shape)
     # module.weight.data = now_w
     out = cal_matrix(input_data, now_w, group)
     loss = (out - org_out).float().pow(2)
@@ -620,30 +699,34 @@ def get_loss_by_s_and_zp(module, zp, s, data_type, org_out, input_data, group=-1
     return loss
 
 
-def _daq_qdq_4bit(weight, scale, zp, data_type, group=-1):
-    assert data_type in FLOAT_MAPPING, "unexpected data type."
+def _daq_qdq_4bit(weight, scale, zp, code, group=-1):
     if group > 0:
         weight = weight.view(-1, group)
-    allow_data = FLOAT_MAPPING[data_type]
     # scale = scale.copy()
     scale = scale.unsqueeze(dim=-1)
     zp = zp.unsqueeze(dim=-1)
     tensor = weight / scale + zp
-    mid_data = [(allow_data[i] + allow_data[i + 1]) / 2 for i in range(len(allow_data) - 1)]
-    q_tensor = torch.zeros_like(tensor)
-    for i in range(len(allow_data)):
-        data = allow_data[i]
-        if i == 0:
-            q_tensor += torch.where(tensor <= mid_data[i], data, 0)
-        elif i == len(allow_data) - 1:
-            q_tensor += torch.where(tensor > mid_data[i - 1], data, 0)
-        else:
-            q_tensor += torch.where((mid_data[i - 1] < tensor) & (tensor <= mid_data[i]), data, 0)
+    q = tensor.reshape(-1, 1)
+    distance = torch.abs(q - code)
+    idx = torch.argmin(distance, dim=-1)
+    q = torch.gather(code, -1, idx)
+    q_tensor = q.reshape(tensor.shape)
+    # mid_data = [(allow_data[i] + allow_data[i + 1]) / 2 for i in range(len(allow_data) - 1)]
+    # q_tensor = torch.zeros_like(tensor)
+    # for i in range(len(allow_data)):
+    #     data = allow_data[i]
+    #     if i == 0:
+    #         q_tensor += torch.where(tensor <= mid_data[i], data, 0)
+    #     elif i == len(allow_data) - 1:
+    #         q_tensor += torch.where(tensor > mid_data[i - 1], data, 0)
+    #     else:
+    #         q_tensor += torch.where((mid_data[i - 1] < tensor) & (tensor <= mid_data[i]), data, 0)
 
     return ((q_tensor - zp) * scale).half()
 
 
-def daq_apply_scale(module, scales_list, data_type, input_feat_dict=None):
+def daq_apply_scale(module, scales_list, data_types, input_feat_dict=None):
+    code = torch.Tensor(FLOAT_MAPPING[data_types]).cuda()
     for prev_op_name, layer_names, scale, zp in scales_list:
         prev_op = get_op_by_name(module, prev_op_name)
         layers = [get_op_by_name(module, name) for name in layer_names]
@@ -655,7 +738,7 @@ def daq_apply_scale(module, scales_list, data_type, input_feat_dict=None):
                 group = -1
             fc = fc.cuda()
             fc.weight.data = _daq_qdq_4bit(fc.weight.data, s.to(fc.weight.data.device), z.to(fc.weight.data.device),
-                                           data_type, group).reshape(-1, w_shape[1])
+                                           code, group).reshape(-1, w_shape[1])
             fc = fc.cpu()
 
 
@@ -664,10 +747,10 @@ def cal_matrix(act, weight, group):
     if group > 0:
         act = act.reshape(*act.shape[:-1],-1, group)
         weight = weight.reshape(weight.shape[0], weight.shape[1] // group , group)
-        act_shp = act.shape
-        assert 1 < len(act_shp) < 5
-        res = torch.einsum(f'...jk,mjk->...jm', act, weight)
-        res = res.transpose(-2, -1)
+        # act_shp = act.shape
+        # assert 1 < len(act_shp) < 5
+        res = torch.einsum(f'...jk,mjk->...mj', act, weight)
+        # res = res.transpose(-2, -1)
         return res.reshape(*res.shape[:-2],-1)
     else:
         return torch.matmul(act, weight.t())

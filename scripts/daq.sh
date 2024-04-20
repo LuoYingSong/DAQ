@@ -43,4 +43,5 @@ python awq/entry.py --model_path /root/autodl-tmp/abc/8a0442e81540efaeb1a0fe3e95
 
 /public/home/acfanoll2u/miniconda3/envs/py39/bin/python3 awq/entry.py --model_path /public/home/acfanoll2u/dataset/llama7b/Llama-2-7b-hf --run_daq --tasks wikitext --w_bit 4 --q_group_size 256 --q_backend fake --dump daq_cache/Llama-2-7b-w4-256-v2.pt
 
-python awq/entry.py --model_path /public/home/acfanoll2u/dataset/llama7b/Llama-2-7b-hf --calibration daq --run_awq --tasks wikitext --w_bit 4 --q_group_size 128 --q_backend fake --dump awq_cache/Llama-2-7b-hf-daq-calibration-128g.pt --sample 2 --data_type nf
+python awq/entry.py --model_path /public/home/acfanoll2u/dataset/llama7b/Llama-2-7b-hf --calibration daq --run_awq --tasks wikitext --w_bit 4 --q_group_size 128 --q_backend fake --dump awq_cache/Llama-2-7b-hf-daq-calibration-128g-dca-zp.pt --sample 2 --data_type nf
+python awq/entry.py --model_path /root/autodl-tmp/abc/a45aa65bbeb77c1558bc99bedc6779195462dab0 --run_daq --tasks wikitext --w_bit 4 --q_group_size 128 --q_backend fake --dump awq_cache/opt-signGD.pt --sample 2

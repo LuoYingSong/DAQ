@@ -7,6 +7,37 @@ from ..utils.module import set_op_by_name
 
 from transformers.models.bloom.modeling_bloom import BloomBlock
 
+NF4 = [
+    -1.0,
+    -0.6961928009986877,
+    -0.5250730514526367,
+    -0.39491748809814453,
+    -0.28444138169288635,
+    -0.18477343022823334,
+    -0.09105003625154495,
+    0.0,
+    0.07958029955625534,
+    0.16093020141124725,
+    0.24611230194568634,
+    0.33791524171829224,
+    0.44070982933044434,
+    0.5626170039176941,
+    0.7229568362236023,
+    1.0,
+]
+FP4_BNB = [-12.0, -8.0, -6.0, -4.0, -3.0, -2.0, -0.0625, 0, 0.0625, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]
+FP4_E2M1 = [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.0625, 0, 0.0625, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+
+# the order is the same as float list, bit value range is [-7, 7]
+# 1111 = -1, 1110 = -2, 1101= -3, ...
+
+NF4_BIT = [7, 1, 2, 3, 4, 5, 6, 0, -8, -7, -6, -5, -4, -3, -2, -1]
+FP4_BNB_BIT = [-5, -6, -3, -4, -1, -2, -7, 0, 1, 6, 7, 4, 5, 2, 3]
+FP4_E2M1_BIT = [-1, -2, -3, -4, -5, -6, -7, 0, 1, 2, 3, 4, 5, 6, 7]
+
+FLOAT_MAPPING = {"nf4": NF4, "fp4": FP4_BNB, "fp4_e2m1_bnb": FP4_BNB, "fp4_e2m1": FP4_E2M1}
+
+
 EMBEDDING_KEYWORDS = ["embed"]
 LM_HEAD_KEYWORDS = ["lm_head", "embed_out", "output"]
 
@@ -61,6 +92,8 @@ def quantize_nf(x, q_group_size, code, get_scale_zp):
     org_shape = x.shape
     if q_group_size > 0:
         x = x.reshape(-1, q_group_size)
+    else:
+        x = x.squeeze()
     max_val_tensor, _ = torch.max(x, dim=1)
     min_val_tensor, _ = torch.min(x, dim=1)
     scale = (max_val_tensor - min_val_tensor) / (code[-1] - code[0])
@@ -95,6 +128,8 @@ def quantize_nf_sym(x, q_group_size, code, get_scale_zp):
     org_shape = x.shape
     if q_group_size > 0:
         x = x.reshape(-1, q_group_size)
+    else:
+        x = x.squeeze()
     max_val_tensor, _ = torch.max(x.abs(), dim=1)
     scale = max_val_tensor / code[-1]
     scale = scale.unsqueeze(dim=-1)
@@ -120,15 +155,11 @@ def quantize_nf_sym(x, q_group_size, code, get_scale_zp):
 def nf4_quantize(original_func):
     def wrapper(w, n_bit=8, zero_point=True, q_group_size=-1, inplace=False, get_scale_zp=False, data_type='int'):
         if data_type == 'int':
-            return pseudo_quantize_tensor(w, n_bit, zero_point, q_group_size, inplace, get_scale_zp, data_type)
+            return original_func(w, n_bit, zero_point, q_group_size, inplace, get_scale_zp, data_type)
         else:
-            code = torch.tensor([
-                -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-                -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-                0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
-                0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
-                0.7229568362236023, 1.0,
-            ]).to(w.device)
+            if data_type not in FLOAT_MAPPING.keys():
+                raise ValueError("Wrong data type")
+            code = torch.tensor(FLOAT_MAPPING[data_type]).to(w.device)
             if zero_point:
                 return quantize_nf(w, q_group_size, code, get_scale_zp)
             else:

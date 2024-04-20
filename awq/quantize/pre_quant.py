@@ -204,7 +204,8 @@ def run_awq(
                 awq_results["clip"] += append_str_prefix(
                     clip_list, get_op_name(model, layer) + "."
                 )
-        elif use_cali == 'daq' and q_config.get('data_type') == 'nf':
+        elif use_cali == 'daq' and \
+                (q_config.get('data_type').startswith('nf') or q_config.get('data_type').startswith('fp')):
             from .daq import search_module_scale, daq_apply_scale, daq_auto_scale_block
             layer = layer.cuda()
             scales_list = daq_auto_scale_block(

@@ -91,11 +91,11 @@ q_config = {
 }
 print("Quantization config:", q_config)
 
-hyper_parameters={'data_types': 'nf4',
-                                  'bins': 10,
+hyper_parameters={'data_types': args.data_type,
+                                  'bins': 80,
                                   'epsilon': .001,
                                   'alpha': .001,
-                                  'num_epoch': 5,
+                                  'num_epoch': 10,
                                   'num_iter': 100,
                                   'group': args.q_group_size}
 
