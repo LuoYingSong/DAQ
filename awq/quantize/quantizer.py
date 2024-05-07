@@ -100,6 +100,15 @@ def quantize_nf(x, q_group_size, code, get_scale_zp):
     zp = code[-1] - max_val_tensor / scale
     scale = scale.unsqueeze(dim=-1)
     zp = zp.unsqueeze(dim=-1)
+    q = quant_asym(code, scale, x, zp)
+    q = q.reshape(org_shape)
+    if get_scale_zp:
+        return q, scale.view(q.shape[0], -1), zp.view(q.shape[0], -1)
+    else:
+        return q
+
+
+def quant_asym(code, scale, x, zp):
     q = x / scale + zp
     # q = q.reshape(-1, 1)
     # distance = torch.abs(q - code)
@@ -117,11 +126,7 @@ def quantize_nf(x, q_group_size, code, get_scale_zp):
             q_tensor += torch.where((mid_data[i - 1] < q) & (q <= mid_data[i]), data, 0)
     q = q_tensor
     q = (q - zp) * scale
-    q = q.reshape(org_shape)
-    if get_scale_zp:
-        return q, scale.view(q.shape[0], -1), zp.view(q.shape[0], -1)
-    else:
-        return q
+    return q.half()
 
 
 def quantize_nf_sym(x, q_group_size, code, get_scale_zp):
@@ -146,7 +151,7 @@ def quantize_nf_sym(x, q_group_size, code, get_scale_zp):
             q_tensor += torch.where((mid_data[i - 1] < q) & (q <= mid_data[i]), data, 0)
     q = q_tensor
     q = q * scale
-    q = q.reshape(org_shape)
+    q = q.reshape(org_shape).half()
     if get_scale_zp:
         return q, scale.view(q.shape[0], -1)
     else:

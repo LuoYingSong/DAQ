@@ -14,6 +14,7 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMS
 from .pre_quant import get_blocks, move_embed, get_named_linears
 from ..utils.module import get_op_name, get_op_by_name
 from ..utils.module import append_str_prefix, get_op_name
+from .quantizer import quant_asym
 import sys
 from scipy.stats import gaussian_kde
 import numpy as np
@@ -166,24 +167,24 @@ def init_zp_scale(allow_data, bins, fc_w):
 
     # 计算中点作为density
     # density = (lower_quantile + upper_quantile) / 2
-    density = torch.zeros(fc_w.shape[0]).cuda()
-    for i, channel in enumerate(fc_w):
-        density[i] = simple_kde(channel.float())
+    # density = torch.zeros(fc_w.shape[0]).cuda()
+    # for i, channel in enumerate(fc_w):
+    #     density[i] = simple_kde(channel.float())
     # density = find_density_centers(fc_w)
-    density = density.half()
+    # density = density.half()
 
-    k = torch.maximum(max_val_tensor - density, density - min_val_tensor) * .90
-    scale = k / allow_data[-1]
+    # k = torch.maximum(max_val_tensor - density, density - min_val_tensor) * .90
+    # scale = k / allow_data[-1]
     # print(scale)
     # scale = (max_val_tensor - min_val_tensor) / (allow_data[-1] - allow_data[0])
 
-    # max_val_tensor, _ = torch.max(fc_w.abs(), dim=1)
-    # scale = (max_val_tensor) / allow_data[-1]
+    max_val_tensor, _ = torch.max(fc_w.abs(), dim=1)
+    scale = (max_val_tensor) / allow_data[-1]
     # print(scale)
-    zp = - density / scale
+    # zp = - density / scale
     # zp = allow_data[-1] - max_val_tensor / scale
     # print(zp)
-    # zp = torch.zeros_like(scale, dtype=torch.float16)
+    zp = torch.zeros_like(scale, dtype=torch.float16)
     return scale, zp
 
 
@@ -700,29 +701,16 @@ def get_loss_by_s_and_zp(module, zp, s, code, org_out, input_data, group=-1, **k
 
 
 def _daq_qdq_4bit(weight, scale, zp, code, group=-1):
+    org_shape = weight.shape
     if group > 0:
-        weight = weight.view(-1, group)
+        weight = weight.reshape(-1, group)
+    else:
+        weight = weight.squeeze()
     # scale = scale.copy()
     scale = scale.unsqueeze(dim=-1)
     zp = zp.unsqueeze(dim=-1)
-    tensor = weight / scale + zp
-    q = tensor.reshape(-1, 1)
-    distance = torch.abs(q - code)
-    idx = torch.argmin(distance, dim=-1)
-    q = torch.gather(code, -1, idx)
-    q_tensor = q.reshape(tensor.shape)
-    # mid_data = [(allow_data[i] + allow_data[i + 1]) / 2 for i in range(len(allow_data) - 1)]
-    # q_tensor = torch.zeros_like(tensor)
-    # for i in range(len(allow_data)):
-    #     data = allow_data[i]
-    #     if i == 0:
-    #         q_tensor += torch.where(tensor <= mid_data[i], data, 0)
-    #     elif i == len(allow_data) - 1:
-    #         q_tensor += torch.where(tensor > mid_data[i - 1], data, 0)
-    #     else:
-    #         q_tensor += torch.where((mid_data[i - 1] < tensor) & (tensor <= mid_data[i]), data, 0)
-
-    return ((q_tensor - zp) * scale).half()
+    weight = quant_asym(code, scale, weight, zp)
+    return weight.reshape(org_shape)
 
 
 def daq_apply_scale(module, scales_list, data_types, input_feat_dict=None):
