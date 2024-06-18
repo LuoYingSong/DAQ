@@ -56,62 +56,63 @@ FLOAT_MAPPING = {"nf4": NF4, "fp4": FP4_BNB, "fp4_e2m1_bnb": FP4_BNB, "fp4_e2m1"
 INT_MAPPING = {"nf4": NF4_BIT, "fp4": FP4_BNB_BIT, "fp4_e2m1_bnb": FP4_BNB_BIT, "fp4_e2m1": FP4_E2M1_BIT}
 
 
-def find_density_centers_old(data):
-    """
-    对输入的2维Tensor的每一行计算密度中心点。
-    使用高斯核密度估计来找到每行的密度最大值位置。
+# def find_density_centers_old(data):
+#     """
+#     对输入的2维Tensor的每一行计算密度中心点。
+#     使用高斯核密度估计来找到每行的密度最大值位置。
+#
+#     参数:
+#         data (torch.Tensor): 一个2维的Tensor，大小为(n_samples, n_features)
+#
+#     返回:
+#         torch.Tensor: 一个1维的Tensor，包含每一行的密度中心点。
+#     """
+#     # 确保输入是float32或float64类型，因为gaussian_kde需要这样的输入
+#     if data.dtype not in [torch.float32, torch.float64]:
+#         data = data.float()
+#
+#     # 初始化存储密度中心点的数组
+#     density_centers = []
+#
+#     # 将Tensor转换为NumPy数组，因为gaussian_kde使用NumPy数组
+#     data_np = data.detach().cpu().numpy()
+#
+#     # 为每一行数据计算密度中心点
+#     for row in tqdm.tqdm(data_np):
+#         # 创建KDE对象
+#         kde = gaussian_kde(row)
+#         # 定义一个用于评估的点范围
+#         x = np.linspace(row.min(), row.max(), 1000)
+#         kde_values = kde(x)
+#         # 寻找密度最大的点
+#         max_density_x = x[np.argmax(kde_values)]
+#         density_centers.append(max_density_x)
+#
+#     # 将列表转换回PyTorch Tensor并返回
+#     return torch.tensor(density_centers)
+#
+#
+# def simple_kde(data, bandwidth=0.1):
+#     if len(data.shape) > 1:
+#         raise ValueError("Data should be a 1D tensor.")
+#
+#     data = data.unsqueeze(0)  # 将数据转换为[1, N]形状
+#
+#     # 创建一个用于评估密度的点范围
+#     x = torch.linspace(data.min(), data.max(), 1000).to(data.device)
+#     x = x.unsqueeze(1)  # 将x转换为[1000, 1]形状以支持广播
+#
+#     # 计算KDE
+#     kde_values = torch.exp(-0.5 * ((x - data) / bandwidth) ** 2).mean(dim=1) / (bandwidth * np.sqrt(2 * np.pi))
+#
+#     # 计算加权平均以确定密度中心
+#     weighted_sum = (x.squeeze() * kde_values).sum()
+#     total_weight = kde_values.sum()
+#
+#     density_center = weighted_sum / total_weight
+#
+#     return density_center.item()
 
-    参数:
-        data (torch.Tensor): 一个2维的Tensor，大小为(n_samples, n_features)
-
-    返回:
-        torch.Tensor: 一个1维的Tensor，包含每一行的密度中心点。
-    """
-    # 确保输入是float32或float64类型，因为gaussian_kde需要这样的输入
-    if data.dtype not in [torch.float32, torch.float64]:
-        data = data.float()
-
-    # 初始化存储密度中心点的数组
-    density_centers = []
-
-    # 将Tensor转换为NumPy数组，因为gaussian_kde使用NumPy数组
-    data_np = data.detach().cpu().numpy()
-
-    # 为每一行数据计算密度中心点
-    for row in tqdm.tqdm(data_np):
-        # 创建KDE对象
-        kde = gaussian_kde(row)
-        # 定义一个用于评估的点范围
-        x = np.linspace(row.min(), row.max(), 1000)
-        kde_values = kde(x)
-        # 寻找密度最大的点
-        max_density_x = x[np.argmax(kde_values)]
-        density_centers.append(max_density_x)
-
-    # 将列表转换回PyTorch Tensor并返回
-    return torch.tensor(density_centers)
-
-
-def simple_kde(data, bandwidth=0.1):
-    if len(data.shape) > 1:
-        raise ValueError("Data should be a 1D tensor.")
-
-    data = data.unsqueeze(0)  # 将数据转换为[1, N]形状
-
-    # 创建一个用于评估密度的点范围
-    x = torch.linspace(data.min(), data.max(), 1000).to(data.device)
-    x = x.unsqueeze(1)  # 将x转换为[1000, 1]形状以支持广播
-
-    # 计算KDE
-    kde_values = torch.exp(-0.5 * ((x - data) / bandwidth) ** 2).mean(dim=1) / (bandwidth * np.sqrt(2 * np.pi))
-
-    # 计算加权平均以确定密度中心
-    weighted_sum = (x.squeeze() * kde_values).sum()
-    total_weight = kde_values.sum()
-
-    density_center = weighted_sum / total_weight
-
-    return density_center.item()
 
 def init_zp_scale(allow_data, bins, fc_w):
     max_val_tensor, _ = torch.max(fc_w, dim=1)
@@ -166,20 +167,20 @@ def init_zp_scale(allow_data, bins, fc_w):
     upper_quantile = torch.quantile(fc_w.float(), 0.975, dim=1)
 
     # 计算中点作为density
-    # density = (lower_quantile + upper_quantile) / 2
+    density = (lower_quantile + upper_quantile) / 2
     # density = torch.zeros(fc_w.shape[0]).cuda()
     # for i, channel in enumerate(fc_w):
     #     density[i] = simple_kde(channel.float())
     # density = find_density_centers(fc_w)
     # density = density.half()
 
-    # k = torch.maximum(max_val_tensor - density, density - min_val_tensor) * .90
-    # scale = k / allow_data[-1]
+    k = torch.maximum(max_val_tensor - density, density - min_val_tensor) * .90
+    scale = k / allow_data[-1]
     # print(scale)
     # scale = (max_val_tensor - min_val_tensor) / (allow_data[-1] - allow_data[0])
 
-    max_val_tensor, _ = torch.max(fc_w.abs(), dim=1)
-    scale = (max_val_tensor) / allow_data[-1]
+    # max_val_tensor, _ = torch.max(fc_w.abs(), dim=1)
+    # scale = (max_val_tensor) / allow_data[-1]
     # print(scale)
     # zp = - density / scale
     # zp = allow_data[-1] - max_val_tensor / scale
@@ -210,21 +211,13 @@ def search_module_scale(block, linears2scale: list, raw_data, kwargs={}, hyper_p
         logging.debug("%s", str(fc))
         x = raw_data
         fc_w = fc.weight.data
-        logging.info("Act. shape:%s Weight shape:%s",x.shape, fc_w.shape)
+        logging.info("Act. shape:%s Weight shape:%s", x.shape, fc_w.shape)
         if group > 0:
             fc_w = fc_w.reshape(-1, group)
-        # if len(x.shape) > 2:
-        #     global bsz, seq
-        #     bsz, seq, feature = x.shape
-        # else:
-        #     # x = x.reshape(bsz, seq, -1)
-        #     pass
-        # x = x.sum(dim=0)
         # Step1 初始化scale
-        logging.debug("new x:%s w:%s",x.shape, fc_w.shape)
+        logging.debug("new x:%s w:%s", x.shape, fc_w.shape)
         scale, zp = init_zp_scale(code, bins, fc_w)
         rate = 5
-
         # Step2 调优scale 和 weight
         org_out = cal_matrix(x, fc.weight.data, group)
         init_loss = get_loss_by_s_and_zp(fc, zp, scale, code, org_out, x, group, **kwargs)
@@ -461,7 +454,6 @@ def daq_auto_scale_block(module, module_kwargs,
         module_kwargs.pop("use_cache")
 
     # find the best scale ratio
-
 
     def _auto_get_scale(prev_op, layers, inp, module2inspect=None, kwargs={}):
         # module2inspect: if given, we will check the output diff of this module instead of layers
@@ -731,14 +723,14 @@ def daq_apply_scale(module, scales_list, data_types, input_feat_dict=None):
 
 
 def cal_matrix(act, weight, group):
-    #act [i, j, k, group] weight [-1, group] # old_version torch.matmul(x, fc_w.t())
+    # act [i, j, k, group] weight [-1, group] # old_version torch.matmul(x, fc_w.t())
     if group > 0:
-        act = act.reshape(*act.shape[:-1],-1, group)
-        weight = weight.reshape(weight.shape[0], weight.shape[1] // group , group)
+        act = act.reshape(*act.shape[:-1], -1, group)
+        weight = weight.reshape(weight.shape[0], weight.shape[1] // group, group)
         # act_shp = act.shape
         # assert 1 < len(act_shp) < 5
         res = torch.einsum(f'...jk,mjk->...mj', act, weight)
         # res = res.transpose(-2, -1)
-        return res.reshape(*res.shape[:-2],-1)
+        return res.reshape(*res.shape[:-2], -1)
     else:
         return torch.matmul(act, weight.t())
