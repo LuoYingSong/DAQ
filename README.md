@@ -4,7 +4,7 @@
 
 1. Clone this repository and navigate to DAQ folder
 ```bash
-git clone xxx
+git clone http://this/repo
 cd daq
 ```
 
@@ -17,9 +17,15 @@ pip install -e .
 ```
 
 ## Usage
-To run DAQ on the model:
+To run DAQ:
 ```bash
-python awq/entry.py --sample 1 --model_path /root/autodl-tmp/opt --run_daq --tasks wikitext --w_bit 4 --q_group_size -1 --q_backend fake --dump daq_cache/opt-6.7b-w4-channel-1block.pt
+python awq/entry.py --sample 1 --model_path /Llama-2-7b-hf --run_daq --tasks wikitext --w_bit 4 --q_group_size -1 --q_backend fake --dump daq_cache/Llama-2-7b-hf-daq-sym-dca-channel-nf4.pt
+```
+
+To run DAQ+AWQ on the model:
+
+```bash
+python awq/entry.py --model_path /Llama-2-7b-hf --calibration daq --run_awq --tasks wikitext --w_bit 4 --q_group_size -1 --q_backend fake --dump awq_cache/Llama-2-7b-hf-daq-sym-dca-channel-nf4.pt --sample 2 --data_type nf4
 ```
 
 ## Acknowledgements
