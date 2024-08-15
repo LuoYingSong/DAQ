@@ -22,7 +22,7 @@ To run DAQ:
 python awq/entry.py --sample 1 --model_path /Llama-2-7b-hf --run_daq --tasks wikitext --w_bit 4 --q_group_size -1 --q_backend fake --dump daq_cache/Llama-2-7b-hf-daq-sym-dca-channel-nf4.pt
 ```
 
-To run DAQ+AWQ on the model:
+To run DAQ+AWQ:
 
 ```bash
 python awq/entry.py --model_path /Llama-2-7b-hf --calibration daq --run_awq --tasks wikitext --w_bit 4 --q_group_size -1 --q_backend fake --dump awq_cache/Llama-2-7b-hf-daq-sym-dca-channel-nf4.pt --sample 2 --data_type nf4
