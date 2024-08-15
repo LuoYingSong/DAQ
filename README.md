@@ -19,13 +19,13 @@ pip install -e .
 ## Usage
 To run DAQ:
 ```bash
-python awq/entry.py --sample 1 --model_path /Llama-2-7b-hf --run_daq --tasks wikitext --w_bit 4 --q_group_size -1 --q_backend fake --dump daq_cache/Llama-2-7b-hf-daq-sym-dca-channel-nf4.pt
+python awq/entry.py --sample 1 --model_path /Llama-2-7b-hf --run_daq --tasks wikitext --w_bit 4 --q_group_size -1 --q_backend fake --dump daq_cache/Llama-2-7b-hf.pt
 ```
 
 To run DAQ+AWQ:
 
 ```bash
-python awq/entry.py --model_path /Llama-2-7b-hf --calibration daq --run_awq --tasks wikitext --w_bit 4 --q_group_size -1 --q_backend fake --dump awq_cache/Llama-2-7b-hf-daq-sym-dca-channel-nf4.pt --sample 2 --data_type nf4
+python awq/entry.py --model_path /Llama-2-7b-hf --calibration daq --run_awq --tasks wikitext --w_bit 4 --q_group_size -1 --q_backend fake --dump awq_cache/Llama-2-7b-hf.pt --sample 2 --data_type nf4
 ```
 
 ## Acknowledgements
